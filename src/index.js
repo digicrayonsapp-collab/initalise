@@ -1,14 +1,17 @@
-const express = require("express");
-const helmet = require("helmet");
-const { httpLogger, log } = require("./core/logger");
-const { AppError, toAppError } = require("./core/errors");
-const { initSQLite, markJob, setKV } = require("./infra/sqlite"); // ⬅️ added setKV
-const { tickRunner } = require("./infra/scheduler");
-const routes = require("./api/routes");
-const { get } = require("./config/env");
-const { DateTime } = require("luxon");
+'use strict';
 
-const { getAzureAccessToken } = require("./services/graphAuth");
+const express = require('express');
+const helmet = require('helmet');
+
+const { httpLogger, log } = require('./core/logger');
+const { AppError, toAppError, getSafeErrorPayload } = require('./core/errors');
+const { initSQLite, markJob, setKV } = require('./infra/sqlite');
+const { tickRunner } = require('./infra/scheduler');
+const routes = require('./api/routes');
+const { get, getInt } = require('./config/env');
+const { DateTime } = require('luxon');
+
+const { getAzureAccessToken } = require('./services/graphAuth');
 const {
   findByEmployeeId,
   findByEmail,
@@ -17,413 +20,400 @@ const {
   getDeletedUser,
   revokeUserSessions,
   deleteUser,
-  updateUser, // already used elsewhere; fine to keep
-} = require("./services/graphUser");
+  updateUser,
+  // optional helpers used during create flow
+  getNextEmployeeId,
+  upsertUser,
+} = require('./services/graphUser');
+
 const {
   officialEmailFromUpn,
   updateCandidateOfficialEmail,
-} = require("./services/zohoPeople");
+  getLastEmployeeIdFromZoho,
+  updateCandidateFields
+} = require('./services/zohoPeople');
+
+// optional: event bus and mailer (graceful no-op if absent)
+let bus = null;
+try { ({ initBus: require('./core/bus').initBus, bus } = require('./core/bus')); } catch (_) { }
+let sendMail = null;
+try { ({ sendMail } = require('./infra/email')); } catch (_) { }
+
+require('dotenv').config();
+
+/* ------------------------------ mail helpers ------------------------------- */
+
+const EMAIL_MODE = (get('EMAIL_MODE', 'event') || 'event').toLowerCase(); // event|summary|both|off
+const EMAIL_SUBJECT_PREFIX = get('EMAIL_SUBJECT_PREFIX', '[Zoho-Azure Sync]');
+const TO_SUCCESS = (get('EMAIL_TO_SUCCESS', '') || '').trim();
+const TO_FAILURE = (get('EMAIL_TO_FAILURE', '') || '').trim();
+
+const mailEnabled = !!sendMail && EMAIL_MODE !== 'off';
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+async function mailSuccess(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_SUCCESS) return;
+  try {
+    await sendMail({
+      to: TO_SUCCESS,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre>${escapeHtml(body)}</pre>`
+    });
+  } catch (e) {
+    log.warn({ err: e && (e.message || String(e)) }, '[MAIL] success email failed');
+  }
+}
+async function mailFailure(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_FAILURE) return;
+  try {
+    await sendMail({
+      to: TO_FAILURE,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre>${escapeHtml(body)}</pre>`
+    });
+  } catch (e) {
+    log.warn({ err: e && (e.message || String(e)) }, '[MAIL] failure email failed');
+  }
+}
+function emitSafe(event, payload) { try { if (bus && bus.emit) bus.emit(event, payload); } catch (_) { } }
+
+/* -------------------------------- utilities -------------------------------- */
 
 function mask(s) {
-  if (!s) return "MISSING";
-  s = String(s);
-  return s.length <= 6 ? "***" : `${s.slice(0, 3)}…${s.slice(-3)}`;
+  if (!s) return 'MISSING';
+  const v = String(s);
+  return v.length <= 6 ? '***' : `${v.slice(0, 3)}…${v.slice(-3)}`;
 }
-console.log(
-  "🔧 Azure env:",
-  "tenant=",
-  mask(process.env.AZURE_TENANT_ID),
-  "clientId=",
-  mask(process.env.AZURE_CLIENT_ID),
-  "secretSet=",
-  !!process.env.AZURE_CLIENT_SECRET
-);
 
-// in src/index.js
+const TZ = process.env.TZ || 'Asia/Kolkata';
+
+function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+
+function normalizeType(t) { return String(t || '').trim().toLowerCase(); }
+
+/* --------------------------------- executor -------------------------------- */
+
 async function executor(job) {
-  // Always parse payload
-  const payload = typeof job.payload === "string" ? JSON.parse(job.payload) : job.payload;
+  const startedUtc = new Date().toISOString();
+  const startedIst = DateTime.now().setZone(TZ).toFormat('dd-LL-yyyy HH:mm:ss ZZZZ');
+  const payload = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload || {};
 
-  // Common banner
-  const rawType = job.type;
-  const type = String(rawType || "").trim().toLowerCase();
-  const tz = process.env.TZ || "Asia/Kolkata";
-  const nowUtc = new Date().toISOString();
-  const nowIst = DateTime.now().setZone(tz).toFormat("dd-LL-yyyy HH:mm:ss ZZZZ");
-  log.info(`🚀 Running job ${job.id} [${job.type}] for candidate ${payload?.candidateId ?? "n/a"} at UTC=${nowUtc} / ${tz}=${nowIst}`);
+  const type = normalizeType(job.type);
+  log.info({ jobId: job.id, type, startedUtc, startedIst }, '[EXEC] job start');
 
-  // For "create" or "createFromCandidate" type jobs
-  if (type === "create" || type === "createfromcandidate") {
+  // ----------------------------- CREATE / PREHIRE ----------------------------
+  if (type === 'create' || type === 'createfromcandidate') {
     try {
       const {
         firstname, lastname, email, employeeId, domain, candidateId,
         country, city, mobilePhone, department, zohoRole, company,
-        employementType, employeeType, officelocation, joiningdate,
+        employementType, employeeType, officelocation, joiningdate
       } = payload;
 
-      log.info(`🔧 Upsert for candidateId=${candidateId ?? "n/a"} firstname=${firstname} lastname=${lastname}`);
+      log.info({ candidateId, firstname: !!firstname, lastname: !!lastname, hasEmail: !!email, employeeId: !!employeeId }, '[CREATE] payload summary');
 
-      // Token
-      log.info('🔑 [create] Getting Azure token…');
+      // token
       const token = await getAzureAccessToken();
-      log.info('✅ [create] Azure token OK');
 
-      // Check if the user already exists in Azure by employeeId, email, or UPN
-      let userExists = false;
+      // EXISTS? Prefer employeeId, then email
       let existingUser = null;
-
-      try {
-        // Check by employeeId first
-        existingUser = await findByEmployeeId(token, employeeId);
-        if (existingUser) {
-          userExists = true;
-          log.info(`✅ [create] User already exists in Azure with employeeId=${employeeId}`);
-        }
-      } catch (error) {
-        log.warn("⚠️ [create] User lookup failed:", error.message);
+      try { if (employeeId) existingUser = await findByEmployeeId(token, employeeId); } catch (e) { log.warn({ err: e?.message || String(e) }, '[CREATE] findByEmployeeId failed'); }
+      if (!existingUser && email) {
+        try { existingUser = await findByEmail(token, email); } catch (e) { log.warn({ err: e?.message || String(e) }, '[CREATE] findByEmail failed'); }
       }
 
-      if (!userExists && email) {
-        try {
-          // Fallback check by email
-          existingUser = await findByEmail(token, email);
-          if (existingUser) {
-            userExists = true;
-            log.info(`✅ [create] User already exists in Azure with email=${email}`);
-          }
-        } catch (error) {
-          log.warn("⚠️ [create] Email lookup failed:", error.message);
-        }
-      }
+      if (existingUser) {
+        log.info({ employeeId, upn: existingUser.userPrincipalName, id: existingUser.id }, '[CREATE] user exists → skip create');
 
-      if (userExists) {
-        // If the user exists, skip the creation and mark the job as done
-        log.info("ℹ️ [create] Skipping user creation as user already exists.");
-
-        // ✅ start a short cool-down so any echo webhook right now won't re-schedule
+        // cooldown to suppress echo webhook
         try {
           if (candidateId) {
-            const cooldownMin = parseInt(process.env.PREHIRE_COOLDOWN_MINUTES || "3", 10);
+            const cooldownMin = toInt(process.env.PREHIRE_COOLDOWN_MINUTES || '3', 3);
             const cooldownMs = Math.max(0, cooldownMin) * 60 * 1000;
             setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + cooldownMs));
           }
-        } catch (e) {
-          log.warn("⚠️ [create] Failed to set cooldown:", e?.message || e);
-        }
+        } catch (e) { log.warn({ err: e?.message || String(e) }, '[CREATE] set cooldown failed'); }
 
-        // Mark job as done (optionally include a result)
-        markJob(job.id, {
-          status: "done",
-          result: {
-            action: "already_exists",
-            userId: existingUser?.id || null,
-            upn: existingUser?.userPrincipalName || null,
-          },
-        });
-        return; // Exit the job if user exists
+        markJob(job.id, { status: 'done', result: { action: 'already_exists', userId: existingUser.id, upn: existingUser.userPrincipalName } });
+        await mailSuccess('CREATE skipped (exists)', `jobId=${job.id}\nupn=${existingUser.userPrincipalName}\nuserId=${existingUser.id}`);
+        emitSafe('sync:success', { action: 'user-create-skip', upn: existingUser.userPrincipalName, employee_id: existingUser.employeeId });
+        return;
       }
 
-      // Continue with user creation if user doesn't exist
-      let effectiveEmployeeId = employeeId;
+      // determine employeeId if missing
+      let effectiveEmployeeId = employeeId || null;
 
-      // Employee ID generation (fallback to Graph scan)
       if (!effectiveEmployeeId) {
         try {
-          const { getLastEmployeeIdFromZoho } = require("./services/zohoPeople");
           const last = await getLastEmployeeIdFromZoho();
           if (Number.isFinite(last)) {
             const next = last + 1;
             effectiveEmployeeId = String(next);
-            const { setKV } = require("./infra/sqlite");
             setKV('EMPLOYEE_ID_SEQ', next);
-            log.info(`🆔 [create] From Zoho: ${last} → ${next}`);
+            log.info({ last, next }, '[CREATE] employeeId from Zoho');
           }
         } catch (e) {
-          log.warn("⚠️ [create] Zoho last Employee_ID fetch failed:", e?.response?.data || e?.message || e);
+          log.warn({ err: e?.response?.data || e?.message || String(e) }, '[CREATE] Zoho last Employee_ID fetch failed');
         }
       }
 
       if (!effectiveEmployeeId) {
         try {
-          const { bumpKVInt, getKVInt } = require("./infra/sqlite");
-          const prev = getKVInt('EMPLOYEE_ID_SEQ', 0);
-          if (prev > 0) {
-            const next = bumpKVInt('EMPLOYEE_ID_SEQ');
-            effectiveEmployeeId = String(next);
-            log.warn(`⚠️ 🆔 [cache] Using cached sequence: ${prev} → ${next} (Zoho unavailable)`);
-          }
-        } catch (e) {
-          log.warn("⚠️ [create] KV fallback failed:", e?.message || e);
-        }
-      }
-
-      if (!effectiveEmployeeId) {
-        try {
-          const { getNextEmployeeId } = require("./services/graphUser"); // scans Graph users
-          const next = await getNextEmployeeId(token);
+          const next = await getNextEmployeeId(token); // Graph scan
           effectiveEmployeeId = String(next);
           const n = parseInt(next, 10);
-          if (Number.isFinite(n)) {
-            const { setKV } = require("./infra/sqlite");
-            setKV('EMPLOYEE_ID_SEQ', n);
-          }
-          log.info(`🆔 [create] From Azure scan: ${next}`);
+          if (Number.isFinite(n)) setKV('EMPLOYEE_ID_SEQ', n);
+          log.info({ next }, '[CREATE] employeeId from Azure scan');
         } catch (e) {
-          log.warn("⚠️ [create] Azure scan for next employeeId failed:", e?.response?.data || e?.message || e);
+          log.warn({ err: e?.response?.data || e?.message || String(e) }, '[CREATE] Azure scan for next employeeId failed');
         }
       }
 
-      // ✅ define empType and pass it to upsertUser
       const empType = employeeType || employementType || null;
 
-      const { upsertUser, updateUser } = require("./services/graphUser");
       const result = await upsertUser(token, {
         firstname, lastname, email,
         employeeId: effectiveEmployeeId,
         domain,
         country, city, mobilePhone, department, zohoRole, company,
-        employeeType: empType,        // correct key
-        employementType: empType,     // keep legacy in sync
-        officelocation,
+        employeeType: empType,        // canonical
+        employementType: empType,     // legacy mirror
+        officelocation
       });
-      log.info(`✅ [create] Azure ${result.action}: id=${result.userId}, upn=${result.upn}`);
 
-      // Optional hire date
+      log.info({ action: result.action, userId: result.userId, upn: result.upn }, '[CREATE] upsert result');
+
+      // optional hire date
       if (joiningdate) {
         try {
-          const [dd, mm, yyyy] = String(joiningdate).split("-");
+          const [dd, mm, yyyy] = String(joiningdate).split('-');
           const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
           if (!isNaN(dt.getTime())) {
-            await updateUser(token, result.userId, { employeeHireDate: dt.toISOString().replace(/\.\d{3}Z$/, "Z") });
-            log.info("✅ [create] employeeHireDate set");
+            await updateUser(token, result.userId, { employeeHireDate: dt.toISOString().replace(/\.\d{3}Z$/, 'Z') });
+            log.info({ hireDate: dt.toISOString() }, '[CREATE] employeeHireDate set');
           }
-        } catch (e) {
-          log.warn("⚠️ [create] Failed to set employeeHireDate:", e.message);
-        }
+        } catch (e) { log.warn({ err: e?.message || String(e) }, '[CREATE] set employeeHireDate failed'); }
       }
 
-      // Push Official Email & Employee ID back to Zoho (using helpers you already have)
+      // push back to Zoho
       if (candidateId) {
         try {
           const official = officialEmailFromUpn(result.upn);
           const officialField = process.env.OFFICIAL_EMAIL_FIELD_LINK_NAME || 'Other_Email';
           const empIdField = process.env.ZOHO_EMPLOYEEID_FIELD_LINK_NAME || 'Employee_ID';
-
-          const { updateCandidateFields } = require("./services/zohoPeople");
           const fields = { [officialField]: official };
           if (effectiveEmployeeId) fields[empIdField] = String(effectiveEmployeeId);
-
           await updateCandidateFields({ recordId: candidateId, fields });
-          log.info("✅ [create] Zoho Candidate updated with Official Email & Employee ID");
-        } catch (zerr) {
-          log.warn("⚠️ [create] Zoho update failed:", zerr?.response?.data || zerr?.message || zerr);
-        }
+          log.info({ candidateId, fields: Object.keys(fields) }, '[CREATE] Zoho candidate updated');
+        } catch (zerr) { log.warn({ err: zerr?.response?.data || zerr?.message || String(zerr) }, '[CREATE] Zoho candidate update failed'); }
       }
 
-      // ===== SUCCESS BOOKKEEPING + COOL-DOWN =====
+      // cooldown + mark done
       try {
-        // start a short cool-down to suppress any immediate webhook echo
         if (candidateId) {
-          const cooldownMin = parseInt(process.env.PREHIRE_COOLDOWN_MINUTES || "3", 10);
+          const cooldownMin = toInt(process.env.PREHIRE_COOLDOWN_MINUTES || '3', 3);
           const cooldownMs = Math.max(0, cooldownMin) * 60 * 1000;
           setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + cooldownMs));
         }
+      } catch (e) { log.warn({ err: e?.message || String(e) }, '[CREATE] set cooldown failed'); }
 
-        markJob(job.id, {
-          status: "done",
-          result: { userId: result.userId, upn: result.upn, action: result.action },
-        });
-      } catch {
-        markJob(job.id, { status: "done" });
-      }
+      markJob(job.id, { status: 'done', result: { userId: result.userId, upn: result.upn, action: result.action } });
+      await mailSuccess('CREATE completed', `jobId=${job.id}\nuserId=${result.userId}\nupn=${result.upn}\nemployeeId=${effectiveEmployeeId || ''}`);
+      emitSafe('sync:success', { action: 'user-create', upn: result.upn, employee_id: effectiveEmployeeId });
       return;
     } catch (e) {
       const details = e?.response?.data || e?.message || String(e);
-      log.error('❌ [create] Failed:', details);
-      markJob(job.id, { status: "failed", lastError: details });
+      log.error({ details }, '[CREATE] failed');
+      markJob(job.id, { status: 'failed', lastError: details });
+      await mailFailure('CREATE failed', `jobId=${job.id}\nerror=${String(details)}`);
+      emitSafe('sync:failure', { action: 'user-create', error: details });
       return;
     }
   }
-  if (type === "deleteuser") {
-    const { employeeId, email, upn } = (typeof payload === "string" ? JSON.parse(payload) : payload) || {};
-    const nowUtc2 = DateTime.utc().toISO();
-    const nowIst2 = DateTime.now().setZone(tz).toFormat("dd-LL-yyyy HH:mm:ss ZZZZ");
-    log.info(`🗑️ [deleteUser] Start UTC=${nowUtc2} / ${tz}=${nowIst2}`);
-    log.info("🧩 [deleteUser] Payload:", { employeeId, email, upn });
 
+  // --------------------------------- DELETE ---------------------------------
+  if (type === 'deleteuser') {
     try {
-      log.info("🔑 [deleteUser] Fetching Azure token…");
+      const { employeeId, email, upn } = payload || {};
+      log.info({ employeeId, hasEmail: !!email, hasUpn: !!upn }, '[DELETE] payload summary');
+
       const token = await getAzureAccessToken();
-      log.info("✅ [deleteUser] Azure token OK");
 
-      // Lookups: employeeId first, then email/UPN (verify employeeId if provided)
-      log.info(`🔎 [deleteUser] Lookup by employeeId="${employeeId}"…`);
-      let user = employeeId ? await findByEmployeeId(token, String(employeeId).trim()) : null;
-
+      // Resolve strictly by employeeId; fallbacks must verify employeeId equality if provided
+      let user = null;
+      if (employeeId) {
+        try { user = await findByEmployeeId(token, String(employeeId).trim()); } catch (e) { log.warn({ err: e?.message || String(e) }, '[DELETE] findByEmployeeId failed'); }
+      }
       if (!user && email) {
-        log.info(`🔎 [deleteUser] Fallback by email="${email}" (verify employeeId)…`);
-        const byEmail = await findByEmail(token, String(email).trim());
-        if (byEmail && (!employeeId || String(byEmail.employeeId ?? "").trim() === String(employeeId).trim())) {
-          user = byEmail;
-          log.info("✅ [deleteUser] Email matched" + (employeeId ? " and employeeId verified" : ""));
-        } else if (byEmail) {
-          log.warn("⛔ [deleteUser] Email matched but employeeId mismatch", {
-            azureEmployeeId: String(byEmail.employeeId ?? "").trim(),
-            zohoEmployeeId: String(employeeId ?? "").trim(),
-          });
-        }
+        try {
+          const byEmail = await findByEmail(token, String(email).trim());
+          if (byEmail && (!employeeId || String(byEmail.employeeId ?? '').trim() === String(employeeId).trim())) user = byEmail;
+          else if (byEmail && employeeId) log.warn({ azureEmpId: byEmail.employeeId, zohoEmpId: employeeId }, '[DELETE] email matched but employeeId mismatch');
+        } catch (e) { log.warn({ err: e?.message || String(e) }, '[DELETE] findByEmail failed'); }
       }
-
       if (!user && upn) {
-        log.info(`🔎 [deleteUser] Fallback by UPN="${upn}" (verify employeeId)…`);
-        const byUpn = await findUserByUPN(token, String(upn).trim());
-        if (byUpn && (!employeeId || String(byUpn.employeeId ?? "").trim() === String(employeeId).trim())) {
-          user = byUpn;
-          log.info("✅ [deleteUser] UPN matched" + (employeeId ? " and employeeId verified" : ""));
-        } else if (byUpn) {
-          log.warn("⛔ [deleteUser] UPN matched but employeeId mismatch", {
-            azureEmployeeId: String(byUpn.employeeId ?? "").trim(),
-            zohoEmployeeId: String(employeeId ?? "").trim(),
-          });
-        }
+        try {
+          const byUpn = await findUserByUPN(token, String(upn).trim());
+          if (byUpn && (!employeeId || String(byUpn.employeeId ?? '').trim() === String(employeeId).trim())) user = byUpn;
+          else if (byUpn && employeeId) log.warn({ azureEmpId: byUpn.employeeId, zohoEmpId: employeeId }, '[DELETE] UPN matched but employeeId mismatch');
+        } catch (e) { log.warn({ err: e?.message || String(e) }, '[DELETE] findUserByUPN failed'); }
       }
 
       if (!user) {
-        log.warn("⚠️ [deleteUser] User not found with matching criteria");
-        markJob(job.id, { status: "failed", lastError: "User not found for delete" });
+        log.warn({}, '[DELETE] user not found with matching criteria');
+        markJob(job.id, { status: 'failed', lastError: 'User not found for delete' });
+        await mailFailure('DELETE failed: user not found', `jobId=${job.id}\nemployeeId=${employeeId || ''}\nemail=${email || ''}\nupn=${upn || ''}`);
+        emitSafe('sync:failure', { action: 'user-delete', error: 'not-found' });
         return;
       }
 
-      // Optional read-before
+      // before snapshot (best effort)
       try {
-        const before = await getUser(token, user.id, "id,userPrincipalName,employeeId,accountEnabled");
-        log.info(`[deleteUser] Before delete: upn=${before?.userPrincipalName}, empId=${before?.employeeId}, enabled=${String(before?.accountEnabled)}`);
-      } catch (e) {
-        log.warn("[deleteUser] Read-before failed:", e?.response?.data || e?.message || e);
-      }
+        const before = await getUser(token, user.id, 'id,userPrincipalName,employeeId,accountEnabled');
+        log.info({ upn: before?.userPrincipalName, empId: before?.employeeId, enabled: before?.accountEnabled }, '[DELETE] pre-delete snapshot');
+      } catch (e) { log.warn({ err: e?.response?.data || e?.message || String(e) }, '[DELETE] pre-read failed'); }
 
-      // Revoke sessions (best-effort), then DELETE
-      try {
-        log.info(`🔒 [deleteUser] Revoking sign-in sessions for userId=${user.id}…`);
-        await revokeUserSessions(token, user.id);
-        log.info("✅ [deleteUser] Sessions revoked");
-      } catch (e) {
-        log.warn("⚠️ [deleteUser] revokeSignInSessions failed:", e?.response?.data || e?.message || e);
-      }
+      // revoke sessions
+      try { await revokeUserSessions(token, user.id); log.info({ userId: user.id }, '[DELETE] sessions revoked'); }
+      catch (e) { log.warn({ err: e?.response?.data || e?.message || String(e) }, '[DELETE] revoke sessions failed'); }
 
-      try {
-        log.info(`🗑️ [deleteUser] Deleting userId=${user.id}, upn=${user.userPrincipalName}`);
-        await deleteUser(token, user.id);
-        log.info("✅ [deleteUser] Delete status=204");
-      } catch (e) {
-        const details = e?.response?.data || e?.message || e;
-        log.error("❌ [deleteUser] DELETE /users/{id} failed:", details);
-        markJob(job.id, { status: "failed", lastError: details });
+      // delete
+      try { await deleteUser(token, user.id); log.info({ userId: user.id }, '[DELETE] delete completed'); }
+      catch (e) {
+        const details = e?.response?.data || e?.message || String(e);
+        log.error({ details }, '[DELETE] delete failed');
+        markJob(job.id, { status: 'failed', lastError: details });
+        await mailFailure('DELETE failed', `jobId=${job.id}\nerror=${String(details)}`);
+        emitSafe('sync:failure', { action: 'user-delete', error: details });
         return;
       }
 
-      // Verify not resolvable + Deleted Items present
-      try {
-        await getUser(token, user.id, "id");
-        log.warn("⚠️ [deleteUser] Verification: user still resolvable (unexpected)");
-      } catch (e) {
-        if (e?.response?.status === 404) log.info("🧾 [deleteUser] Verification: user no longer resolvable (404 ✅)");
-        else log.warn("[deleteUser] Verify read failed:", e?.response?.data || e?.message || e);
-      }
-      try {
-        const inBin = await getDeletedUser(token, user.id);
-        log.info(`[deleteUser] Deleted Items check: ${inBin ? "present ✅" : "not found"}`);
-      } catch (e) {
-        log.warn("[deleteUser] Deleted Items check failed:", e?.response?.data || e?.message || e);
-      }
+      // verification
+      try { await getUser(token, user.id, 'id'); log.warn({}, '[DELETE] verification: user still resolvable'); }
+      catch (e) { if (e?.response?.status === 404) log.info({}, '[DELETE] verification: user not resolvable (404)'); else log.warn({ err: e?.response?.data || e?.message || String(e) }, '[DELETE] verify read failed'); }
+      try { const inBin = await getDeletedUser(token, user.id); log.info({ present: !!inBin }, '[DELETE] deleted items check'); }
+      catch (e) { log.warn({ err: e?.response?.data || e?.message || String(e) }, '[DELETE] deleted items check failed'); }
 
-      markJob(job.id, { status: "done" });
-      log.info(`📦 [deleteUser] Job ${job.id} done`);
+      markJob(job.id, { status: 'done' });
+      await mailSuccess('DELETE completed', `jobId=${job.id}\nuserId=${user.id}\nupn=${user.userPrincipalName}`);
+      emitSafe('sync:success', { action: 'user-delete', upn: user.userPrincipalName, employee_id: user.employeeId });
       return;
     } catch (e) {
       const details = e?.response?.data || e?.message || String(e);
-      log.error("❌ [deleteUser] Failed:", details);
-      markJob(job.id, { status: "failed", lastError: details });
+      log.error({ details }, '[DELETE] failed');
+      markJob(job.id, { status: 'failed', lastError: details });
+      await mailFailure('DELETE failed', `jobId=${job.id}\nerror=${String(details)}`);
+      emitSafe('sync:failure', { action: 'user-delete', error: details });
       return;
     }
   }
 
-  if (type === "disableuser") {
-    const { employeeId, email, upn } = payload || {};
-    log.info("🛑 [disableUser] Start with", { employeeId, email, upn });
-
+  // -------------------------------- DISABLE ---------------------------------
+  if (type === 'disableuser') {
     try {
-      const token = await getAzureAccessToken();
-      log.info("✅ [disableUser] Azure token OK");
+      const { employeeId, email, upn } = payload || {};
+      log.info({ employeeId, hasEmail: !!email, hasUpn: !!upn }, '[DISABLE] payload summary');
 
-      // Lookup user by employeeId → email → upn
-      let user = employeeId ? await findByEmployeeId(token, String(employeeId).trim()) : null;
-      if (!user && email) user = await findByEmail(token, String(email).trim());
-      if (!user && upn) user = await findUserByUPN(token, String(upn).trim());
+      const token = await getAzureAccessToken();
+
+      let user = null;
+      if (employeeId) { try { user = await findByEmployeeId(token, String(employeeId).trim()); } catch (e) { } }
+      if (!user && email) { try { user = await findByEmail(token, String(email).trim()); } catch (e) { } }
+      if (!user && upn) { try { user = await findUserByUPN(token, String(upn).trim()); } catch (e) { } }
 
       if (!user) {
-        log.warn("⚠️ [disableUser] User not found");
-        markJob(job.id, { status: "failed", lastError: "User not found for disable" });
+        log.warn({}, '[DISABLE] user not found');
+        markJob(job.id, { status: 'failed', lastError: 'User not found for disable' });
+        await mailFailure('DISABLE failed: user not found', `jobId=${job.id}\nemployeeId=${employeeId || ''}\nemail=${email || ''}\nupn=${upn || ''}`);
+        emitSafe('sync:failure', { action: 'user-disable', error: 'not-found' });
         return;
       }
 
-      // Disable user in Azure (accountEnabled = false)
       await updateUser(token, user.id, { accountEnabled: false });
-      log.info(`✅ [disableUser] User disabled → id=${user.id}, upn=${user.userPrincipalName}`);
+      log.info({ userId: user.id, upn: user.userPrincipalName }, '[DISABLE] user disabled');
 
-      // Success bookkeeping
-      markJob(job.id, { status: "done" });
+      markJob(job.id, { status: 'done' });
+      await mailSuccess('DISABLE completed', `jobId=${job.id}\nuserId=${user.id}\nupn=${user.userPrincipalName}`);
+      emitSafe('sync:success', { action: 'user-disable', upn: user.userPrincipalName, employee_id: user.employeeId });
       return;
     } catch (e) {
       const details = e?.response?.data || e?.message || String(e);
-      log.error("❌ [disableUser] Failed:", details);
-      markJob(job.id, { status: "failed", lastError: details });
+      log.error({ details }, '[DISABLE] failed');
+      markJob(job.id, { status: 'failed', lastError: details });
+      await mailFailure('DISABLE failed', `jobId=${job.id}\nerror=${String(details)}`);
+      emitSafe('sync:failure', { action: 'user-disable', error: details });
       return;
     }
   }
 
-
-  // Unknown job type
+  // ------------------------------ UNKNOWN TYPE ------------------------------
   const msg = `Unknown job type: ${job.type}`;
-  log.warn(`⚠️ ${msg}`);
-  markJob(job.id, { status: "failed", lastError: msg });
+  log.warn({ type: job.type }, '[EXEC] unknown job type');
+  markJob(job.id, { status: 'failed', lastError: msg });
+  await mailFailure('JOB failed: unknown type', `jobId=${job.id}\ntype=${String(job.type)}`);
 }
+
+/* --------------------------------- server ---------------------------------- */
 
 function buildApp() {
   const app = express();
   app.use(helmet());
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true }));
   app.use(httpLogger);
 
-  app.use("/api", routes);
+  app.use('/api', routes);
 
-  app.use((req, res, next) => next(new AppError(404, "Not Found")));
+  app.use((req, res, next) => next(new AppError(404, 'Not Found')));
   app.use((err, req, res, next) => {
     const e = toAppError(err);
-    log.error("Error", e.message, e.details || "");
-    res
-      .status(e.status || 500)
-      .json({ message: e.message, details: e.details });
+    const payload = getSafeErrorPayload(e);
+    log.error({ url: req.originalUrl, status: payload.status, code: payload.code, details: payload.details }, '[HTTP] error');
+    res.status(payload.status || 500).json(payload);
   });
   return app;
 }
 
 async function bootstrap() {
-  process.on("unhandledRejection", (r) =>
-    console.error("unhandledRejection", r)
+  // Azure env summary (masked)
+  log.info(
+    {
+      tenant: mask(process.env.AZURE_TENANT_ID),
+      clientId: mask(process.env.AZURE_CLIENT_ID),
+      secretSet: !!process.env.AZURE_CLIENT_SECRET
+    },
+    '[BOOT] Azure environment'
   );
-  process.on("uncaughtException", (e) => {
-    console.error("uncaughtException", e);
-  });
+
+  process.on('unhandledRejection', (r) => console.error('[FATAL] unhandledRejection', r));
+  process.on('uncaughtException', (e) => console.error('[FATAL] uncaughtException', e));
+
+  try {
+    if (bus && typeof require('./core/bus').initBus === 'function') {
+      require('./core/bus').initBus();
+      log.info({}, '[BOOT] bus initialized');
+    }
+  } catch (e) {
+    log.warn({ err: e && (e.message || String(e)) }, '[BOOT] bus init failed');
+  }
 
   await initSQLite();
-  const app = buildApp();
-  const port = parseInt(get("PORT", 3008), 10);
-  app.listen(port, "0.0.0.0", () => log.info(`🚀 http://0.0.0.0:${port}`));
 
-  const { tickRunner } = require("./infra/scheduler");
-  tickRunner(executor);
+  const app = buildApp();
+  const port = getInt('PORT', 3008);
+  app.listen(port, '0.0.0.0', () => log.info({ url: `http://0.0.0.0:${port}` }, '[BOOT] server listening'));
+
+  // start scheduler
+  try {
+    tickRunner(executor);
+    log.info({}, '[BOOT] scheduler started');
+  } catch (e) {
+    log.error({ err: e && (e.message || String(e)) }, '[BOOT] scheduler failed to start');
+  }
 }
 
 bootstrap();

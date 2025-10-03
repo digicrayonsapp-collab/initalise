@@ -1,91 +1,120 @@
-// src/infra/sqlite.js
+'use strict';
+
+/**
+ * src/infra/sqlite.js
+ */
+
 const fs = require('fs');
 const path = require('path');
 const { log } = require('../core/logger');
 
 const dataDir = path.join(process.cwd(), 'data');
 const dbFile = path.join(dataDir, 'jobs.sqlite');
+const tmpFile = dbFile + '.tmp';
+
+const JOB_FETCH_LIMIT = Number.isFinite(parseInt(process.env.JOB_FETCH_LIMIT, 10))
+  ? parseInt(process.env.JOB_FETCH_LIMIT, 10)
+  : 20;
 
 let SQL = null;
 let db = null;
+
+/* column presence flags (for legacy DBs) */
 let hasCreatedAt = false;
 let hasUpdatedAt = false;
 let hasResult = false;
+let hasStatus = false;
+let hasAttempts = false;
+let hasLastError = false;
 
 function ensureDataDir() {
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-}
-
-function findLatestJobByCandidate(type, candidateId) {
-  if (!db) throw new Error('DB not initialized');
-  const pattern = `%\"candidateId\":\"${String(candidateId)}\"%`;
-  const sql = `
-    SELECT id, type, status, runAt, createdAt, updatedAt
-    FROM jobs
-    WHERE type = ?
-      AND payload LIKE ?
-    ORDER BY createdAt DESC
-    LIMIT 1
-  `;
-  const stmt = db.prepare(sql);
-  stmt.bind([type, pattern]);
-  let row = null;
-  if (stmt.step()) row = stmt.getAsObject();
-  stmt.free();
-  return row; // or null
-}
-
-
-function persist() {
-  const data = Buffer.from(db.export());
-  fs.writeFileSync(dbFile, data);
-}
-
-function tableExists(name) {
-  const res = db.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name='${name}'`);
-  return res && res[0] && res[0].values && res[0].values.length > 0;
-}
-
-function refreshJobsColumnsFlags() {
-  const info = db.exec(`PRAGMA table_info('jobs')`);
-  hasCreatedAt = false;
-  hasUpdatedAt = false;
-  hasResult = false;
-  if (info && info[0]) {
-    const rows = info[0].values; // [cid, name, type, notnull, dflt_value, pk]
-    for (const r of rows) {
-      const colName = r[1];
-      if (colName === 'createdAt') hasCreatedAt = true;
-      if (colName === 'updatedAt') hasUpdatedAt = true;
-      if (colName === 'result') hasResult = true;
-    }
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch (e) {
+    // If directory exists or cannot be created, throw for visibility
+    if (!fs.existsSync(dataDir)) throw e;
   }
 }
 
-// In your `ensureJobsTable()` function, add a 'status' column
+function persist() {
+  if (!db) return;
+  try {
+    const data = Buffer.from(db.export());
+    // atomic-ish persist: write temp then rename
+    fs.writeFileSync(tmpFile, data);
+    fs.renameSync(tmpFile, dbFile);
+  } catch (e) {
+    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (_) { }
+    log.warn('[SQLITE] persist failed: %s', e && (e.message || String(e)));
+  }
+}
+
+function tableExists(name) {
+  const res = db.exec(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name=$name`,
+    { $name: name }
+  );
+  return !!(res && res[0] && res[0].values && res[0].values.length > 0);
+}
+
+function columnExists(table, column) {
+  const info = db.exec(`PRAGMA table_info('${table}')`);
+  if (!info || !info[0] || !info[0].values) return false;
+  return info[0].values.some((row) => row[1] === column);
+}
+
+function refreshJobsColumnsFlags() {
+  hasCreatedAt = columnExists('jobs', 'createdAt');
+  hasUpdatedAt = columnExists('jobs', 'updatedAt');
+  hasResult = columnExists('jobs', 'result');
+  hasStatus = columnExists('jobs', 'status');
+  hasAttempts = columnExists('jobs', 'attempts');
+  hasLastError = columnExists('jobs', 'lastError');
+}
+
+/* ------------------------------- migrations -------------------------------- */
+
 function ensureJobsTable() {
   if (!tableExists('jobs')) {
     db.run(`
       CREATE TABLE jobs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT NOT NULL,
-  runAt INTEGER NOT NULL,
-  status TEXT DEFAULT 'pending',
-  attempts INTEGER DEFAULT 0,
-  payload TEXT,
-  lastError TEXT,
-  result TEXT,
-  createdAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),  -- Ensure it's not null
-  updatedAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)   -- Ensure it's not null
-);
-      CREATE INDEX jobs_run_idx ON jobs(runAt, status);
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        runAt INTEGER NOT NULL,
+        status TEXT DEFAULT 'pending',
+        attempts INTEGER DEFAULT 0,
+        payload TEXT,
+        lastError TEXT,
+        result TEXT,
+        createdAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+        updatedAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+      );
     `);
+    db.run(`CREATE INDEX jobs_run_idx ON jobs(runAt, status);`);
     refreshJobsColumnsFlags();
     persist();
     return;
   }
-}
 
+  // Existing DB → add any missing columns/indexes
+  refreshJobsColumnsFlags();
+
+  if (!hasStatus) db.run(`ALTER TABLE jobs ADD COLUMN status TEXT DEFAULT 'pending';`);
+  if (!hasAttempts) db.run(`ALTER TABLE jobs ADD COLUMN attempts INTEGER DEFAULT 0;`);
+  if (!hasLastError) db.run(`ALTER TABLE jobs ADD COLUMN lastError TEXT;`);
+  if (!hasResult) db.run(`ALTER TABLE jobs ADD COLUMN result TEXT;`);
+  if (!hasCreatedAt) db.run(`ALTER TABLE jobs ADD COLUMN createdAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000);`);
+  if (!hasUpdatedAt) db.run(`ALTER TABLE jobs ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000);`);
+
+  // Ensure index exists (create if missing)
+  const idx = db.exec(`SELECT name FROM sqlite_master WHERE type='index' AND name='jobs_run_idx'`);
+  if (!idx || !idx[0] || !idx[0].values || idx[0].values.length === 0) {
+    db.run(`CREATE INDEX jobs_run_idx ON jobs(runAt, status);`);
+  }
+
+  refreshJobsColumnsFlags();
+  persist();
+}
 
 function ensureKvTable() {
   db.run(`
@@ -97,6 +126,8 @@ function ensureKvTable() {
   `);
   persist();
 }
+
+/* --------------------------------- init ------------------------------------ */
 
 async function initSQLite() {
   ensureDataDir();
@@ -114,39 +145,68 @@ async function initSQLite() {
 
   ensureJobsTable();
   ensureKvTable();
-  log.info('🗄️ SQLite ready at', dbFile);
+  log.info('[SQLITE] ready at %s', dbFile);
+}
+
+/* ------------------------------ job utilities ------------------------------ */
+
+function _likePatternsForCandidateId(candidateId) {
+  // Support both `"candidateId":"123"` and `"candidateId":123`
+  const id = String(candidateId);
+  return [
+    `%\"candidateId\":\"${id}\"%`,
+    `%\"candidateId\":${id}%`
+  ];
+}
+
+function findLatestJobByCandidate(type, candidateId) {
+  if (!db) throw new Error('DB not initialized');
+
+  const [pQuoted, pNumeric] = _likePatternsForCandidateId(candidateId);
+  const sql = `
+    SELECT id, type, status, runAt, createdAt, updatedAt
+    FROM jobs
+    WHERE type = ?
+      AND (payload LIKE ? OR payload LIKE ?)
+    ORDER BY createdAt DESC
+    LIMIT 1
+  `;
+  const stmt = db.prepare(sql);
+  stmt.bind([type, pQuoted, pNumeric]);
+  let row = null;
+  if (stmt.step()) row = stmt.getAsObject();
+  stmt.free();
+  return row;
 }
 
 function findActiveJobByCandidate(type, candidateId) {
   if (!db) throw new Error('DB not initialized');
-  // We store payload as JSON text; search for `"candidateId":"<id>"`
-  // (candidateId is numeric/string from Zoho; safe in LIKE)
-  const pattern = `%\"candidateId\":\"${String(candidateId)}\"%`;
+
+  const [pQuoted, pNumeric] = _likePatternsForCandidateId(candidateId);
   const sql = `
     SELECT id, runAt, status
     FROM jobs
     WHERE type = ?
       AND status IN ('pending','running')
-      AND payload LIKE ?
+      AND (payload LIKE ? OR payload LIKE ?)
     ORDER BY runAt DESC
     LIMIT 1
   `;
   const stmt = db.prepare(sql);
-  stmt.bind([type, pattern]);
+  stmt.bind([type, pQuoted, pNumeric]);
   let row = null;
   if (stmt.step()) row = stmt.getAsObject();
   stmt.free();
   return row; // {id, runAt, status} or null
 }
 
-
 function upsertJob({ type, runAt, payload }) {
   if (!db) throw new Error('DB not initialized');
 
-  const nowMs = Date.now(); // Get current timestamp in milliseconds
+  const nowMs = Date.now();
 
-  const cols = ['type', 'runAt', 'payload', 'status', 'createdAt', 'updatedAt']; // Include 'updatedAt' column
-  const vals = [type, runAt, JSON.stringify(payload || {}), 'pending', nowMs, nowMs]; // Assign 'createdAt' and 'updatedAt' with the current timestamp
+  const cols = ['type', 'runAt', 'payload', 'status'];
+  const vals = [type, runAt, JSON.stringify(payload || {}), 'pending'];
 
   if (hasCreatedAt) { cols.push('createdAt'); vals.push(nowMs); }
   if (hasUpdatedAt) { cols.push('updatedAt'); vals.push(nowMs); }
@@ -162,14 +222,20 @@ function upsertJob({ type, runAt, payload }) {
   return id;
 }
 
-
 function fetchDueJobs(nowMs) {
   if (!db) throw new Error('DB not initialized');
-  const stmt = db.prepare(
-    'SELECT id, type, runAt, status, attempts, payload FROM jobs WHERE status = ? AND runAt <= ? ORDER BY runAt ASC LIMIT 20'
-  );
+
+  const sql = `
+    SELECT id, type, runAt, status, attempts, payload
+    FROM jobs
+    WHERE status = 'pending' AND runAt <= ?
+    ORDER BY runAt ASC
+    LIMIT ?
+  `;
+  const stmt = db.prepare(sql);
+  stmt.bind([nowMs, JOB_FETCH_LIMIT]);
+
   const rows = [];
-  stmt.bind(['pending', nowMs]);
   while (stmt.step()) {
     const r = stmt.getAsObject();
     rows.push({
@@ -187,14 +253,11 @@ function fetchDueJobs(nowMs) {
 
 function markJob(id, fields) {
   if (!db) throw new Error('DB not initialized');
-  const updates = [];
-  const vals = [];
 
-  // Always bump updatedAt
-  updates.push('updatedAt = ?');
-  vals.push(Date.now());
+  const updates = ['updatedAt = ?'];
+  const vals = [Date.now()];
 
-  for (const [k, v] of Object.entries(fields)) {
+  for (const [k, v] of Object.entries(fields || {})) {
     updates.push(`${k} = ?`);
     if (v === null || v === undefined) {
       vals.push(null);
@@ -211,7 +274,7 @@ function markJob(id, fields) {
   persist();
 }
 
-/* ----------------------------- KV convenience ------------------------------ */
+/* ---------------------------------- KV ------------------------------------- */
 
 function getKV(key) {
   if (!db) throw new Error('DB not initialized');
@@ -228,12 +291,19 @@ function getKV(key) {
 function setKV(key, value) {
   if (!db) throw new Error('DB not initialized');
   const now = Date.now();
-  const existing = getKV(key);
-  if (existing === null || existing === undefined) {
-    db.run(`INSERT INTO kv (key, value, updatedAt) VALUES (?, ?, ?)`, [key, String(value), now]);
-  } else {
-    db.run(`UPDATE kv SET value = ?, updatedAt = ? WHERE key = ?`, [String(value), now, key]);
+
+  // Try update; if no row changed, insert
+  const upd = db.prepare(`UPDATE kv SET value = ?, updatedAt = ? WHERE key = ?`);
+  upd.run([String(value), now, key]);
+  upd.free();
+
+  const changed = db.getRowsModified && db.getRowsModified();
+  if (!changed) {
+    const ins = db.prepare(`INSERT INTO kv (key, value, updatedAt) VALUES (?, ?, ?)`);
+    ins.run([key, String(value), now]);
+    ins.free();
   }
+
   persist();
 }
 
@@ -248,6 +318,8 @@ function bumpKVInt(key, startAt = 1) {
   setKV(key, next);
   return next;
 }
+
+/* --------------------------------- exports --------------------------------- */
 
 module.exports = {
   initSQLite,

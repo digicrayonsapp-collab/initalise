@@ -1,236 +1,282 @@
-const express = require("express");
+'use strict';
+
+require('dotenv').config();
+
+const express = require('express');
+const axios = require('axios');
+const qs = require('qs');
+
 const app = express();
-const axios = require("axios");
-const PORT = 3008;
-const qs = require("qs");
-const { initBus, bus } = require('./src/core/bus');
-require("dotenv").config();
+const PORT = Number(process.env.PORT || 3008);
 
+/* ----------------------------- infrastructure ------------------------------ */
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const { initBus, bus } = (() => {
+  try { return require('./src/core/bus'); } catch (_) { return { initBus: () => { }, bus: null }; }
+})();
+const { upsertJob } = (() => {
+  try { return require('./src/infra/sqlite'); } catch (_) { return { upsertJob: () => Date.now() }; }
+})();
+const { get, getInt } = (() => {
+  try { return require('./config/env'); } catch (_) { return { get: (k, d) => process.env[k] ?? d, getInt: (k, d) => { const n = parseInt(process.env[k], 10); return Number.isFinite(n) ? n : d; } }; }
+})();
+
+// optional mailer; if absent, emailing no-ops safely
+let sendMail = null;
+try { ({ sendMail } = require('./src/infra/email')); } catch (_) { /* no mailer present */ }
+
+const EMAIL_MODE = (get('EMAIL_MODE', 'event') || 'event').toLowerCase();
+const EMAIL_SUBJECT_PREFIX = get('EMAIL_SUBJECT_PREFIX', '[Zoho-Azure Sync]');
+const TO_SUCCESS = (get('EMAIL_TO_SUCCESS', '') || '').trim();
+const TO_FAILURE = (get('EMAIL_TO_FAILURE', '') || '').trim();
+
+const mailEnabled = !!sendMail && EMAIL_MODE !== 'off';
+function escapeHtml(s) {
+  return String(s).replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+async function mailSuccess(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_SUCCESS) return;
+  try {
+    await sendMail({
+      to: TO_SUCCESS,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre>${escapeHtml(body)}</pre>`
+    });
+  } catch (e) { console.warn('[MAIL] success email failed:', e && (e.message || String(e))); }
+}
+async function mailFailure(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_FAILURE) return;
+  try {
+    await sendMail({
+      to: TO_FAILURE,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre>${escapeHtml(body)}</pre>`
+    });
+  } catch (e) { console.warn('[MAIL] failure email failed:', e && (e.message || String(e))); }
+}
+
+function emitSafe(event, payload) {
+  try { if (bus && bus.emit) bus.emit(event, payload); } catch (_) { }
+}
+
+/* --------------------------------- express --------------------------------- */
+
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+
+// event bus boot (if present)
 initBus();
 
-// const AZURE_TOKEN = "eyJ0eXAiOiJKV1QiLCJub25jZSI6IkdnMUlxdVBUSk1kZS1ET2UwVzdoMGJ0ZVk5aU12X0hRV2xQalRhbnVac00iLCJhbGciOiJSUzI1NiIsIng1dCI6IkpZaEFjVFBNWl9MWDZEQmxPV1E3SG4wTmVYRSIsImtpZCI6IkpZaEFjVFBNWl9MWDZEQmxPV1E3SG4wTmVYRSJ9.eyJhdWQiOiJodHRwczovL2dyYXBoLm1pY3Jvc29mdC5jb20iLCJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC85ZGJmNjU4NS01ZWIxLTRkMjYtODAyZS1hYWY3NTMyMzZjYjAvIiwiaWF0IjoxNzU2ODAzNTE1LCJuYmYiOjE3NTY4MDM1MTUsImV4cCI6MTc1NjgwNzQxNSwiYWlvIjoiazJSZ1lIaXovSGdEWi9DQmJpWHIxYy85WStjR0FnQT0iLCJhcHBfZGlzcGxheW5hbWUiOiJab2hvIFBlb3BsZSBJbnRlZ3JhdGlvbiIsImFwcGlkIjoiNzk1ODI5YWItNzllYy00MWYwLWJmOTQtYmM3ZmVmYjIwZDUzIiwiYXBwaWRhY3IiOiIxIiwiaWRwIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvOWRiZjY1ODUtNWViMS00ZDI2LTgwMmUtYWFmNzUzMjM2Y2IwLyIsImlkdHlwIjoiYXBwIiwib2lkIjoiZGMwOGVkNTctNGEwMS00NWY1LTliNWItZDFhZDVmNWQ5ZDdmIiwicmgiOiIxLkFjWUFoV1dfbmJGZUprMkFMcXIzVXlOc3NBTUFBQUFBQUFBQXdBQUFBQUFBQUFEcEFBREdBQS4iLCJyb2xlcyI6WyJVc2VyLlJlYWRXcml0ZS5BbGwiLCJEaXJlY3RvcnkuUmVhZFdyaXRlLkFsbCJdLCJzdWIiOiJkYzA4ZWQ1Ny00YTAxLTQ1ZjUtOWI1Yi1kMWFkNWY1ZDlkN2YiLCJ0ZW5hbnRfcmVnaW9uX3Njb3BlIjoiQVMiLCJ0aWQiOiI5ZGJmNjU4NS01ZWIxLTRkMjYtODAyZS1hYWY3NTMyMzZjYjAiLCJ1dGkiOiJxN3dJMWo3Y2dVcUpteVFaX0pjOEFRIiwidmVyIjoiMS4wIiwid2lkcyI6WyIwOTk3YTFkMC0wZDFkLTRhY2ItYjQwOC1kNWNhNzMxMjFlOTAiXSwieG1zX2Z0ZCI6IkpzM0xMei12cjR3dFRrM1FiNmlYbE9yTUtZS0JUY1U1SXQzZVFnbUVqcGNCYTI5eVpXRmpaVzUwY21Gc0xXUnpiWE0iLCJ4bXNfaWRyZWwiOiI3IDE2IiwieG1zX3JkIjoiMC40MkxqWUJKaU9zWW9KTUxCTGlRZzNockxxTHgyamQtS1J6ZW1WbXRfRndlS2Nnb0pDS2szVkp3OHd1clg4R2JTbkxQVnVuNUFVUTRoQVdZR0NEZ0FwUUUiLCJ4bXNfdGNkdCI6MTc1MTYwNTk4NX0.RtU8x8g1-VNqr7rS9XQwU1NnkSFvPOGS5anIsBqGIL00-9w0UWYhl5_IaUCfQr2He-qlHfcvUxZrX_Oj5U4UqQDQtTqVpsxe8NBh56gJ4mzIXG3lQ-06rgJl6zpUpwLy9IlK3LGnW_mqqzH10lOE5BFggQXm7K_v4JmhTwEL8E8-lO3AW1y353gu64uygNjd32KyqmypGu1KjFMnR1dQa83sRkuX64m8wTh7IoKoMwf211mPhnU84ryRHAk3uVmbl4MoDGwj2BhixhQuzoVu_lF2eFWS0U617SVGJ7vRdNOMlszruAS1b77JC_FHE1xhVQT3gcF3dtxLBdVwONglTg";
-// const ZOHO_TOKEN = "1000.5dc8f86d7b6dd00b3305d25cd6d83a25.f17e14c91ddf1cbfc05d4febc11e92a1"
-const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
-const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
-const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+/* --------------------------------- helpers --------------------------------- */
 
-let AZURE_ACCESS_TOKEN = "";
-const AZURE_CLIENT_ID = process.env.AZURE_CLIENT_ID;
-const AZURE_CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
-const AZURE_TENANT_ID = process.env.AZURE_TENANT_ID;
+const { DateTime } = (() => { try { return require('luxon'); } catch (_) { return { DateTime: null }; } })();
 
+function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+function clamp(n, min, max) { return Math.min(Math.max(n, min), max); }
+const TZ = process.env.TZ || 'Asia/Kolkata';
 
-async function getZohoAccessToken() {
-  const tokenUrl = "https://accounts.zoho.com/oauth/v2/token";
-
-  const formData = qs.stringify({
-    refresh_token: ZOHO_REFRESH_TOKEN,
-    client_id: ZOHO_CLIENT_ID,
-    client_secret: ZOHO_CLIENT_SECRET,
-    grant_type: "refresh_token",
-  });
-
-  const response = await axios.post(tokenUrl, formData, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-
-  return response.data.access_token;
+function parseJoinDateIST(s, zone = TZ) {
+  if (!s || !DateTime) return null;
+  const dt = DateTime.fromFormat(String(s).trim(), 'dd-LL-yyyy', { zone });
+  return dt.isValid ? dt : null;
 }
 
-async function getAzureAccessToken() {
-  try {
-    const response = await axios.post(
-      `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
-      qs.stringify({
-        client_id: AZURE_CLIENT_ID,
-        client_secret: AZURE_CLIENT_SECRET,
-        scope: "https://graph.microsoft.com/.default",
-        grant_type: "client_credentials",
-      }),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
-
-    AZURE_ACCESS_TOKEN = response.data.access_token;
-    console.log("🔄 Refreshed Azure Access Token");
-    return AZURE_ACCESS_TOKEN;
-  } catch (err) {
-    console.error("❌ Failed to refresh Azure token:", err.response?.data || err.message);
-    throw err;
-  }
-}
-
-function _normKey(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ""); }
+function _normKey(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
 function pickWithKey(obj, aliases = []) {
   if (!obj) return { value: undefined, matchedKey: null };
   const lut = {};
   for (const [k, v] of Object.entries(obj)) lut[_normKey(k)] = { v, k };
   for (const a of aliases) {
     const hit = lut[_normKey(a)];
-    if (hit && hit.v !== undefined && hit.v !== null && String(hit.v).trim() !== "") {
+    if (hit && hit.v !== undefined && hit.v !== null && String(hit.v).trim() !== '') {
       return { value: hit.v, matchedKey: hit.k };
     }
   }
   return { value: undefined, matchedKey: null };
 }
+
 function normNickname(first, last) {
-  return `${String(first || "").toLowerCase()}.${String(last || "").toLowerCase()}`
-    .replace(/[^a-z0-9.]/g, "");
+  return `${String(first || '').toLowerCase()}.${String(last || '').toLowerCase()}`
+    .replace(/[^a-z0-9.]/g, '');
 }
 function prefixForEmployeeType(t) {
-  if (!t) return "";
+  if (!t) return '';
   const s = String(t).toLowerCase();
-  if (s.includes("contractor")) return "c-";
-  if (s.includes("intern")) return "i-";
-  return "";
+  if (s.includes('contractor')) return 'c-';
+  if (s.includes('intern')) return 'i-';
+  return '';
+}
+function odataQuote(str) {
+  // escape single-quotes per OData by doubling them
+  return String(str).replace(/'/g, "''");
 }
 
+/* ---------------------------- tokens & clients ----------------------------- */
 
-app.post("/zoho-candidate/edit", async (req, res) => {
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID || '';
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || '';
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || '';
+const ZOHO_DC = (process.env.ZOHO_DC || 'com').trim(); // com | in | eu ...
+
+const AZURE_CLIENT_ID = process.env.AZURE_CLIENT_ID || '';
+const AZURE_CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET || '';
+const AZURE_TENANT_ID = process.env.AZURE_TENANT_ID || '';
+
+axios.defaults.timeout = 15000; // global default timeout
+
+async function getZohoAccessToken() {
+  const tokenUrl = `https://accounts.zoho.${ZOHO_DC}/oauth/v2/token`;
+  const formData = qs.stringify({
+    refresh_token: ZOHO_REFRESH_TOKEN,
+    client_id: ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    grant_type: 'refresh_token'
+  });
+  const res = await axios.post(tokenUrl, formData, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 15000
+  });
+  return res.data.access_token;
+}
+
+async function getAzureAccessToken() {
   try {
-    const data = req.body && Object.keys(req.body).length ? req.body : req.query;
+    const res = await axios.post(
+      `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
+      qs.stringify({
+        client_id: AZURE_CLIENT_ID,
+        client_secret: AZURE_CLIENT_SECRET,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials'
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+    );
+    console.log('[AUTH] Azure access token refreshed');
+    return res.data.access_token;
+  } catch (err) {
+    const details = err?.response?.data || err?.message || String(err);
+    console.error('[AUTH] Azure token refresh failed:', details);
+    throw err;
+  }
+}
 
-    // Robust Employee Type capture
+/* --------------------------------- routes ---------------------------------- */
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+/**
+ * Prehire: compute provisional email based on employee type and update Zoho Candidate.Other_Email
+ */
+app.post('/zoho-candidate/edit', async (req, res) => {
+  try {
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+
     const { value: employeeType, matchedKey: employeeTypeKey } = pickWithKey(data, [
-      "employeeType", "employmentType", "employementType",
-      "Employee_Type", "Employee Type", "EmployeeType",
-      "empType", "typeOfEmployee"
+      'employeeType', 'employmentType', 'employementType', 'Employee_Type', 'Employee Type', 'EmployeeType', 'empType', 'typeOfEmployee'
     ]);
 
     const { id, firstname, lastname } = data;
+    console.log('[PREHIRE] payload keys:', Object.keys(data));
+    console.log('[PREHIRE] employeeType:', employeeType, '(key:', employeeTypeKey, ')');
 
-    console.log("🧾 [prehire] Payload keys:", Object.keys(data));
-    console.log("🧾 [prehire] Employee Type:", employeeType, "(matched key ->", employeeTypeKey, ")");
-    console.log("Candidate received from Zoho Webhook:", data);
-
-    if (!firstname || !lastname || !id) {
-      return res.status(400).json({
-        message: "Missing firstname, lastname, or candidate ID",
-        received: data,
-      });
+    if (!id || !firstname || !lastname) {
+      return res.status(400).json({ message: 'Missing firstname, lastname, or candidate ID', receivedKeys: Object.keys(data || {}) });
     }
 
-    // Build official email with prefix based on Employee Type
-    const domain = process.env.OFFICIAL_EMAIL_DOMAIN || "roundglass.com";
+    const domain = (process.env.OFFICIAL_EMAIL_DOMAIN || get('AZURE_DEFAULT_DOMAIN') || 'roundglass.com').trim();
     const local = normNickname(firstname, lastname);
     const pref = prefixForEmployeeType(employeeType);
     const officialEmail = `${pref}${local}@${domain}`;
 
-    console.log("🧮 [prehire] Email decision:",
-      { employeeType, prefix: pref || "(none)", local, domain, officialEmail });
+    console.log('[PREHIRE] email decision:', { employeeType, prefix: pref || '(none)', local, domain, officialEmail });
 
     const formData = qs.stringify({
       recordId: id,
-      inputData: JSON.stringify({ Other_Email: officialEmail }),
+      inputData: JSON.stringify({ Other_Email: officialEmail })
     });
 
-    // Get fresh Zoho access token before making API call
     const accessToken = await getZohoAccessToken();
-    console.log("🔑 [prehire] Zoho access token acquired.");
+    console.log('[PREHIRE] Zoho access token acquired');
 
-    const zohoResponse = await axios.post(
-      "https://people.zoho.com/api/forms/json/Candidate/updateRecord",
+    const zohoRes = await axios.post(
+      `https://people.zoho.${ZOHO_DC}/api/forms/json/Candidate/updateRecord`,
       formData,
-      {
-        headers: {
-          Authorization: `Zoho-oauthtoken ${accessToken}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
+      { headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
     );
 
-    console.log("✅ [prehire] Zoho Candidate updated with Official Email:", officialEmail);
+    console.log('[PREHIRE] Zoho Candidate updated with official email');
+    emitSafe('sync:success', { action: 'prehire-provisional-email', employee_id: id, upn: officialEmail });
+    await mailSuccess('PREHIRE provisional email set', `candidateId=${id}\nemail=${officialEmail}`);
 
-    res.status(200).json({
-      message: "Official email generated and updated in Candidate record",
+    return res.status(200).json({
+      message: 'Official email generated and updated in Candidate record',
       officialEmail,
       employeeType,
-      zohoResponse: zohoResponse.data,
+      zohoResponse: zohoRes.data
     });
   } catch (error) {
-    console.error(
-      "❌ [prehire] Error processing Zoho webhook:",
-      error.response?.data || error.message
-    );
-    res.status(500).json({
-      message: "Failed to process webhook",
-      error: error.response?.data || error.message,
-    });
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[PREHIRE] processing failed:', details);
+    emitSafe('sync:failure', { action: 'prehire-provisional-email', error: details });
+    await mailFailure('PREHIRE provisional email failed', String(details));
+    return res.status(500).json({ message: 'Failed to process webhook', error: details });
   }
 });
 
-app.post("/zoho-webhook/create", async (req, res) => {
+/**
+ * Create user in Azure AD from Zoho webhook, ensuring unique UPN.
+ */
+app.post('/zoho-webhook/create', async (req, res) => {
   try {
-    const data = req.body && Object.keys(req.body).length ? req.body : req.query;
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
 
     const {
-      email,
-      firstname,
-      lastname,
-      employeeId,
-      city,
-      manager,
-      joiningdate,
-      company,
-      zohoRole,
-      mobilePhone,
-      employementType,
-      workPhone,
-      employeeStatus,
-      country,
-      department,
-      officelocation,
+      email, firstname, lastname, employeeId,
+      city, manager, joiningdate, company, zohoRole,
+      mobilePhone, employementType, workPhone, employeeStatus,
+      country, department, officelocation
     } = data;
 
-    console.log("Candidate received from Zoho Webhook:", data);
+    console.log('[CREATE] payload keys:', Object.keys(data));
 
     if (!firstname || !lastname) {
-      return res.status(400).json({
-        message: "Missing firstname or lastname in webhook payload",
-        received: data,
-      });
+      return res.status(400).json({ message: 'Missing firstname or lastname in webhook payload', receivedKeys: Object.keys(data || {}) });
     }
 
     const accessToken = await getAzureAccessToken();
 
-    const safeNickname = `${firstname}.${lastname}`.toLowerCase()
-      .replace(/[^a-z0-9.]/g, "");
+    const safeNickname = `${firstname}.${lastname}`.toLowerCase().replace(/[^a-z0-9.]/g, '');
+    const domain = (get('AZURE_DEFAULT_DOMAIN') || 'yadavhitesh340gmail.onmicrosoft.com').trim();
 
-    const domain = "yadavhitesh340gmail.onmicrosoft.com";
+    // Unique UPN generation (check & increment)
     let userPrincipalName = `${safeNickname}@${domain}`;
-
     let counter = 1;
+
     while (true) {
-      const checkResponse = await axios.get(
-        `https://graph.microsoft.com/v1.0/users?$filter=userPrincipalName eq '${userPrincipalName}'`,
-        {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }
-      );
-
-      if (checkResponse.data.value.length === 0) {
-        break;
-      }
-
-      userPrincipalName = `${firstname.toLowerCase()}.${lastname.toLowerCase()}${counter}@${domain}`;
+      const filter = encodeURI(`$filter=userPrincipalName eq '${odataQuote(userPrincipalName)}'`);
+      const check = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+      });
+      if (!check.data.value || check.data.value.length === 0) break;
+      userPrincipalName = `${safeNickname}${counter}@${domain}`;
       counter++;
+      if (counter > 50) throw new Error('exhausted upn attempts');
     }
 
-
+    const tempPassword = get('GRAPH_TEMP_PASSWORD', 'TempPass123!');
     const azureUser = {
       accountEnabled: true,
-      displayName: `${firstname} ${lastname}`,
+      displayName: `${firstname} ${lastname}`.trim(),
       mailNickname: safeNickname,
       userPrincipalName,
-      passwordProfile: {
-        forceChangePasswordNextSignIn: true,
-        password: "TempPass123!",
-      },
-      mail: email,
-      givenName: firstname,
-      surname: lastname,
+      passwordProfile: { forceChangePasswordNextSignIn: true, password: tempPassword },
+      mail: email || null,
+      givenName: firstname || null,
+      surname: lastname || null,
       employeeId: employeeId || null,
       country: country || null,
       city: city || null,
@@ -239,71 +285,53 @@ app.post("/zoho-webhook/create", async (req, res) => {
       jobTitle: zohoRole || null,
       companyName: company || null,
       employeeType: employementType || null,
-      officeLocation: officelocation || null,
+      officeLocation: officelocation || null
     };
 
-    const response = await axios.post(
-      "https://graph.microsoft.com/v1.0/users",
-      azureUser,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    const createRes = await axios.post('https://graph.microsoft.com/v1.0/users', azureUser, {
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 20000
+    });
 
-    console.log("✅ User created in Azure AD:", response.data.id);
+    console.log('[CREATE] user created in Azure AD:', createRes.data && createRes.data.id);
 
     if (joiningdate) {
       try {
-        const [dd, mm, yyyy] = joiningdate.split("-");
+        const [dd, mm, yyyy] = String(joiningdate).split('-');
         const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
         if (!isNaN(dt.getTime())) {
-          const hireISO = dt.toISOString().replace(/\.\d{3}Z$/, "Z");
-
+          const hireISO = dt.toISOString().replace(/\.\d{3}Z$/, 'Z');
           await axios.patch(
-            `https://graph.microsoft.com/v1.0/users/${response.data.id}`,
+            `https://graph.microsoft.com/v1.0/users/${createRes.data.id}`,
             { employeeHireDate: hireISO },
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                "Content-Type": "application/json",
-              },
-            }
+            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 15000 }
           );
-
-          console.log("✅ employeeHireDate set:", hireISO);
+          console.log('[CREATE] employeeHireDate set:', hireISO);
         }
-      } catch (dateErr) {
-        console.error("⚠️ Failed to set employeeHireDate:", dateErr.message);
+      } catch (e) {
+        console.warn('[CREATE] failed to set employeeHireDate:', e && (e.message || String(e)));
       }
     }
 
-    res.status(200).json({
-      message: "User successfully created in Azure AD",
-      azureUser: response.data,
-    });
+    emitSafe('sync:success', { action: 'user-create', upn: userPrincipalName, employee_id: employeeId, details: { id: createRes.data.id } });
+    await mailSuccess('CREATE user', `userId=${createRes.data.id}\nupn=${userPrincipalName}`);
 
+    return res.status(200).json({ message: 'User successfully created in Azure AD', azureUser: createRes.data });
   } catch (error) {
-    console.error(
-      "❌ Error creating user in Azure AD:",
-      error.response?.data || error.message
-    );
-    res.status(500).json({
-      message: "Failed to create user in Azure AD",
-      error: error.response?.data || error.message,
-    });
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[CREATE] failed:', details);
+    emitSafe('sync:failure', { action: 'user-create', error: details });
+    await mailFailure('CREATE user failed', String(details));
+    return res.status(500).json({ message: 'Failed to create user in Azure AD', error: details });
   }
 });
 
-// --- DELETE (offboarding) webhook ---
-// Triggers account disable at 14:20 IST on "Date of Exit", or immediately if missing.
-router.post('/zoho-webhook/delete', (req, res) => {
+/**
+ * Offboarding: schedule disable at OFFBOARD_EXEC_HOUR:MIN IST on exit date, or soon if missing/past.
+ */
+app.post('/zoho-webhook/delete', (req, res) => {
   try {
-    const data = Object.keys(req.body || {}).length ? req.body : req.query;
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
 
-    // Accept multiple possible identifier fields (Zoho often uses "Other Email")
     const upn =
       data.userPrincipalName ||
       data.upn ||
@@ -313,36 +341,27 @@ router.post('/zoho-webhook/delete', (req, res) => {
 
     const { email, employeeId } = data;
 
-    // "Date of Exit" can arrive with different keys; accept common variants
     const exitDateRaw =
       data.dateOfExit ||
       data.Date_of_Exit ||
       data['Date of Exit'] ||
       data.dateofexit ||
+      data.dateOFExit ||
       data.exitDate;
 
-    // Config & timing
-    const tz = process.env.TZ || 'Asia/Kolkata';
-    const execHour = parseInt(process.env.OFFBOARD_EXEC_HOUR, 10);
-    const execMin = parseInt(process.env.OFFBOARD_EXEC_MIN, 10);
-    const H = Number.isFinite(execHour) ? execHour : 14;
-    const M = Number.isFinite(execMin) ? execMin : 20;
-    const quickMins = parseInt(process.env.OFFBOARD_OFFSET_MINUTES, 10);
-    const QUICK = Number.isFinite(quickMins) ? quickMins : 1;
+    const execH = clamp(getInt('OFFBOARD_EXEC_HOUR', 14), 0, 23);
+    const execM = clamp(getInt('OFFBOARD_EXEC_MIN', 20), 0, 59);
+    const quickMins = toInt(process.env.OFFBOARD_OFFSET_MINUTES, 1);
 
-    // Parse "Date of Exit" (dd-MM-yyyy preferred; ISO fallback)
-    const exitDtIST = parseJoinDateIST(exitDateRaw, tz); // reuses helper defined above
+    const exitDtIST = parseJoinDateIST(exitDateRaw, TZ);
 
     let runAtDate;
     if (exitDtIST) {
-      const targetIST = exitDtIST.set({ hour: H, minute: M, second: 0, millisecond: 0 });
+      const targetIST = exitDtIST.set({ hour: execH, minute: execM, second: 0, millisecond: 0 });
       const candidate = new Date(targetIST.toUTC().toMillis());
-      runAtDate = (candidate.getTime() <= Date.now())
-        ? new Date(Date.now() + QUICK * 60 * 1000) // if time has passed, do soon
-        : candidate;
+      runAtDate = (candidate.getTime() <= Date.now()) ? new Date(Date.now() + quickMins * 60 * 1000) : candidate;
     } else {
-      // No "Date of Exit" → disable ASAP
-      runAtDate = new Date(Date.now() + QUICK * 60 * 1000);
+      runAtDate = new Date(Date.now() + quickMins * 60 * 1000);
     }
 
     const runAt = runAtDate.getTime();
@@ -350,165 +369,156 @@ router.post('/zoho-webhook/delete', (req, res) => {
     const jobId = upsertJob({
       type: 'disableUser',
       runAt,
-      payload: {
-        // carry all identifiers we might use later
-        upn: upn || null,
-        email: email || null,
-        employeeId: employeeId || null,
-      }
+      payload: { upn: upn || null, email: email || null, employeeId: employeeId || null }
     });
+
+    console.log('[OFFBOARD] disable scheduled', {
+      jobId, runAtUTC: new Date(runAt).toISOString(), exitDateRaw, execAtIST: `${String(execH).padStart(2, '0')}:${String(execM).padStart(2, '0')}`
+    });
+
+    mailSuccess('OFFBOARD scheduled', `employeeId=${employeeId || ''}\nrunAtUTC=${new Date(runAt).toISOString()}`).catch(() => { });
+    emitSafe('sync:success', { action: 'user-disable-scheduled', employee_id: employeeId, upn });
 
     return res.json({
       message: 'scheduled',
       jobId,
       runAt: new Date(runAt).toISOString(),
-      computedFrom: exitDtIST ? 'exitDate-14:20-IST' : 'no-exitDate-immediate',
+      computedFrom: exitDtIST ? 'exitDate-IST' : 'no-exitDate-immediate',
       exitDateIST: exitDtIST ? exitDtIST.toISODate() : null,
-      execAtIST: `${String(H).padStart(2, '0')}:${String(M).padStart(2, '0')}`,
-      quickFallbackMinutes: (exitDtIST && runAtDate.getTime() <= Date.now()) ? QUICK : (exitDtIST ? null : QUICK)
+      execAtIST: `${String(execH).padStart(2, '0')}:${String(execM).padStart(2, '0')}`,
+      quickFallbackMinutes: (!exitDtIST || runAtDate.getTime() <= Date.now()) ? quickMins : null
     });
   } catch (e) {
-    console.error('❌ /zoho-webhook/delete failed:', e.stack || e.message || e);
+    console.error('[OFFBOARD] scheduling failed:', e && (e.stack || e.message || e));
+    mailFailure('OFFBOARD scheduling failed', e && (e.message || String(e))).catch(() => { });
     return res.status(500).json({ message: 'Internal Server Error' });
   }
 });
 
-
-app.post("/zoho-webhook/edit", async (req, res) => {
+/**
+ * Edit: patch Azure user by email/UPN/employeeId, set hire date if provided.
+ */
+app.post('/zoho-webhook/edit', async (req, res) => {
   try {
-    const data = req.body && Object.keys(req.body).length ? req.body : req.query;
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+
+    const upn =
+      data.userPrincipalName ||
+      data.upn ||
+      data.Other_Email ||
+      data['Other Email'] ||
+      data.otherEmail;
 
     const {
-      id,
-      email,
-      firstname,
-      lastname,
-      employeeId,
-      city,
-      manager,
-      dob,
-      age,
-      gender,
-      meritalStatus,
-      bloodGroup,
-      employementStatusComments,
-      askMeAbout,
-      weddingDay,
-      empty,
-      seatingLocation,
-      officelocation,
-      joiningdate,
-      tags,
-      presentAddress,
-      permanentEmailAddress,
-      tehsil,
-      company,
-      zohoRole,
-      mobilePhone,
-      employementType,
-      workPhone,
-      employeeStatus,
-      homePhone,
-      probation,
-      country,
-      rehire,
-      department,
+      email, firstname, lastname, employeeId, city, manager, joiningdate,
+      company, zohoRole, mobilePhone, employementType, workPhone, employeeStatus,
+      country, department, officelocation
     } = data;
 
-    console.log("Candidate received from Zoho Webhook:", data);
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Missing email in webhook payload (used to find Azure user)",
-        received: data,
-      });
+    if (!email && !upn && !employeeId) {
+      return res.status(400).json({ message: 'Provide one of: userPrincipalName/upn/Other_Email or email or employeeId.' });
     }
 
-    // 🔹 Always get a fresh Azure token
-    const accessToken = await getAzureAccessToken();
+    const token = await getAzureAccessToken();
 
-    // 🔹 Find Azure user by email
-    const findResponse = await axios.get(
-      `https://graph.microsoft.com/v1.0/users?$filter=mail eq '${email}'`,
-      {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }
-    );
-
-    if (!findResponse.data.value || findResponse.data.value.length === 0) {
-      return res.status(200).json({
-        message: "User does not exist in Azure AD. Skipping update.",
-      });
+    // Try resolve by UPN -> email -> employeeId
+    let user = null;
+    if (upn) {
+      try {
+        const filter = encodeURI(`$filter=userPrincipalName eq '${odataQuote(upn)}'`);
+        const r = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+        user = r.data.value && r.data.value[0];
+      } catch (e) { /* ignore, try next */ }
+    }
+    if (!user && email) {
+      try {
+        const filter = encodeURI(`$filter=mail eq '${odataQuote(email)}'`);
+        const r = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+        user = r.data.value && r.data.value[0];
+      } catch (e) { /* ignore, try next */ }
+    }
+    if (!user && employeeId) {
+      try {
+        const filter = encodeURI(`$filter=employeeId eq '${odataQuote(employeeId)}'`);
+        const r = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+        user = r.data.value && r.data.value[0];
+      } catch (e) { /* ignore */ }
     }
 
-    const existingUser = findResponse.data.value[0];
+    if (!user) {
+      await mailFailure('UPDATE failed: user not found', `upn=${upn || ''}\nemail=${email || ''}\nemployeeId=${employeeId || ''}`);
+      return res.status(404).json({ message: 'Azure user not found. Provide one of: userPrincipalName/upn/Other_Email or email or employeeId.' });
+    }
 
-    // 🔹 Fields to update
-    const updateUser = {
-      displayName: `${firstname} ${lastname}`,
-      givenName: firstname,
-      surname: lastname,
-      mail: email,
-      employeeId: employeeId || null,
-      country: country || null,
-      city: city || null,
-      mobilePhone: mobilePhone || null,
-      department: department || null,
-      jobTitle: zohoRole || null,
-      companyName: company || null,
-      employeeType: employementType || null,
-      officeLocation: officelocation || null,
+    const patch = {
+      displayName: (firstname || lastname) ? `${firstname || user.givenName || ''} ${lastname || user.surname || ''}`.trim() : undefined,
+      givenName: firstname || undefined,
+      surname: lastname || undefined,
+      mail: email || undefined,
+      employeeId: employeeId || undefined,
+      country: country || undefined,
+      city: city || undefined,
+      mobilePhone: mobilePhone || undefined,
+      department: department || undefined,
+      jobTitle: zohoRole || undefined,
+      companyName: company || undefined,
+      employeeType: employementType || undefined,
+      officeLocation: officelocation || undefined
     };
+    Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
 
-    await axios.patch(
-      `https://graph.microsoft.com/v1.0/users/${existingUser.id}`,
-      updateUser,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    if (Object.keys(patch).length) {
+      await axios.patch(
+        `https://graph.microsoft.com/v1.0/users/${user.id}`,
+        patch,
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 }
+      );
+    }
 
     if (joiningdate) {
       try {
-        const [dd, mm, yyyy] = joiningdate.split("-");
+        const [dd, mm, yyyy] = String(joiningdate).split('-');
         const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
         if (!isNaN(dt.getTime())) {
-          const hireISO = dt.toISOString().replace(/\.\d{3}Z$/, "Z");
-
+          const hireISO = dt.toISOString().replace(/\.\d{3}Z$/, 'Z');
           await axios.patch(
-            `https://graph.microsoft.com/v1.0/users/${existingUser.id}`,
+            `https://graph.microsoft.com/v1.0/users/${user.id}`,
             { employeeHireDate: hireISO },
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                "Content-Type": "application/json",
-              },
-            }
+            { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 15000 }
           );
         }
-      } catch (dateErr) {
-        console.error("⚠️ Failed to set employeeHireDate:", dateErr.message);
+      } catch (e) {
+        console.warn('[UPDATE] failed to set employeeHireDate:', e && (e.message || String(e)));
       }
     }
 
-    res.status(200).json({
-      message: "User successfully updated in Azure AD",
-      azureUser: existingUser.id,
-    });
+    emitSafe('sync:success', { action: 'user-update', upn: user.userPrincipalName, employee_id: user.employeeId, details: { fields: Object.keys(patch) } });
+    await mailSuccess('UPDATE applied', `userId=${user.id}\nupn=${user.userPrincipalName}\nfields=${Object.keys(patch).join(',') || '(none)'}`);
 
-  } catch (error) {
-    console.error(error.response?.data || error.message);
-    res.status(500).json({
-      message: "Failed to update user in Azure AD",
-      error: error.response?.data || error.message,
+    return res.status(200).json({
+      message: 'Azure user updated',
+      userId: user.id,
+      upn: user.userPrincipalName,
+      updatedFields: Object.keys(patch)
     });
+  } catch (error) {
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[UPDATE] failed:', details);
+    emitSafe('sync:failure', { action: 'user-update', error: details });
+    await mailFailure('UPDATE failed', String(details));
+    return res.status(500).json({ message: 'Failed to update Azure user', error: details });
   }
 });
 
+/* --------------------------------- startup --------------------------------- */
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}`);
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err && (err.stack || err.message || err));
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[FATAL] unhandledRejection:', err && (err.stack || err.message || err));
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[BOOT] server listening on http://0.0.0.0:${PORT}`);
 });
