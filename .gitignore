@@ -1,70 +1,56 @@
-# --- env & secrets ---
+# env & secrets
 .env
 .env.*
 !.env.example
 .envrc
 .direnv
 
-# --- local state / cursors ---
+# local state
 .cursor.json
 .replay/
 
-# --- dependencies ---
+# deps / builds / logs
 node_modules/
-
-# --- logs ---
-logs/
-*.log
-*.log.*
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.pnpm-debug.log*
-
-# --- builds & coverage ---
 dist/
 build/
 coverage/
 .nyc_output/
 .cache/
 .tmp/
-tmp/
 temp/
+*.log
+*.log.*
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# --- TypeScript ---
+# TypeScript
 *.tsbuildinfo
 .tsbuildinfo
 
-# --- tool caches ---
+# tools
 .eslintcache
-.parcel-cache/
 .vite/
 .turbo/
+.parcel-cache/
 
-# --- editors/IDE ---
+# editors/OS
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
 .idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-
-# --- OS junk ---
 .DS_Store
 Thumbs.db
-ehthumbs.db
 Icon?
 
-# --- certs/keys (belt & suspenders) ---
+# certs/keys
 *.pem
 *.key
 *.pfx
 *.p12
 *.cer
 
-# --- docker/local overrides ---
+# docker/local overrides
 docker-compose.override.yml
 *.local.yml
