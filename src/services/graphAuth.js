@@ -3,9 +3,11 @@
 /**
  * services/graphAuth.js
  * Returns an Azure AD app-only access token for Microsoft Graph.
+ *
  * API:
  *   - getAzureAccessToken(opts?) -> Promise<string>
  *   - resetAzureTokenCache()     -> void
+ *   - clearAzureTokenCache()     -> void (alias)
  *
  * opts:
  *   { scope?: string, force?: boolean }
@@ -18,7 +20,9 @@ const { get } = require('../config/env');
 const { log } = require('../core/logger');
 
 const TIMEOUT_MS = Number.parseInt(process.env.AZURE_AUTH_TIMEOUT_MS || '20000', 10); // 20s
+const AUTH_HOST = process.env.AZURE_AUTH_HOST || 'login.microsoftonline.com';
 
+// isolated axios for auth calls (no global interceptors)
 const http = axios.create({ timeout: TIMEOUT_MS });
 
 let cache = {
@@ -60,6 +64,7 @@ function setCache(key, token, expiresInSec) {
 
 /**
  * Minimal retry for transient auth errors.
+ * Retries on 429, 5xx, ECONNRESET, ETIMEDOUT. Honors Retry-After.
  */
 async function withRetry(fn, { tries = 3, baseMs = 400 } = {}) {
   let lastErr;
@@ -98,14 +103,26 @@ async function fetchToken({ tenant, clientId, clientSecret, scope }) {
     grant_type: 'client_credentials'
   });
 
-  const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+  const url = `https://${AUTH_HOST}/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
 
+  // Use validateStatus to always resolve; craft clear error for non-200
   const res = await http.post(url, body, {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    validateStatus: () => true
   });
 
-  const token = res?.data?.access_token;
-  const expiresIn = Number.parseInt(res?.data?.expires_in, 10);
+  if (res.status !== 200) {
+    const errMsg =
+      res.data?.error_description ||
+      res.data?.error ||
+      JSON.stringify(res.data || {});
+    throw Object.assign(new Error(`Azure token error (${res.status}): ${errMsg}`), {
+      response: res
+    });
+  }
+
+  const token = res.data?.access_token;
+  const expiresIn = Number.parseInt(res.data?.expires_in, 10);
 
   if (!token || !Number.isFinite(expiresIn)) {
     const msg = 'Invalid token response from Azure AD';
@@ -145,4 +162,6 @@ function resetAzureTokenCache() {
   cache = { key: '', token: '', expMs: 0 };
 }
 
-module.exports = { getAzureAccessToken, resetAzureTokenCache };
+function clearAzureTokenCache() { resetAzureTokenCache(); }
+
+module.exports = { getAzureAccessToken, resetAzureTokenCache, clearAzureTokenCache };

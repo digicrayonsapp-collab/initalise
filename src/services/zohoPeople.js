@@ -20,8 +20,7 @@ function officialEmailFromUpn(upn) {
 }
 
 function zohoAccountsBase() {
-  // e.g. https://accounts.zoho.in or https://accounts.zoho.com
-  const dc = String(ZOHO_DC || 'com').trim();
+  const dc = String(ZOHO_DC || 'com').trim().toLowerCase();
   return `https://accounts.zoho.${dc}`;
 }
 
@@ -65,6 +64,7 @@ async function updateCandidateOfficialEmail({ recordId, officialEmail, fieldLink
   });
 
   const url = `${ZOHO_PEOPLE_BASE}/people/api/forms/json/Candidate/updateRecord`;
+
   const res = await axios.post(url, body, {
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
@@ -83,8 +83,8 @@ async function updateCandidateOfficialEmail({ recordId, officialEmail, fieldLink
 async function fetchEmployeeViewPage({ viewName, slindex = 1, rec_limit = 200 }) {
   const accessToken = await getZohoAccessToken();
   const vname = viewName || process.env.ZOHO_EMPLOYEE_VIEW || 'P_EmployeeView';
-  const url = `${ZOHO_PEOPLE_BASE}/api/forms/${encodeURIComponent(vname)}/records`;
 
+  const url = `${ZOHO_PEOPLE_BASE}/people/api/forms/${encodeURIComponent(vname)}/records`;
   const res = await axios.get(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     params: { slindex, rec_limit },
@@ -100,8 +100,8 @@ async function fetchEmployeeByEmailAlias({ email, viewName, aliasColumn }) {
   const accessToken = await getZohoAccessToken();
   const vname = viewName || process.env.ZOHO_EMPLOYEE_VIEW || 'P_EmployeeView';
   const column = aliasColumn || process.env.ZOHO_EMPLOYEE_ALIAS_COLUMN || 'EMPLOYEEMAILALIASs';
-  const url = `${ZOHO_PEOPLE_BASE}/api/forms/${encodeURIComponent(vname)}/records`;
 
+  const url = `${ZOHO_PEOPLE_BASE}/people/api/forms/${encodeURIComponent(vname)}/records`;
   const res = await axios.get(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     params: { searchColumn: column, searchValue: email },

@@ -1,12 +1,9 @@
 'use strict';
 
-// src/api/routes.js
-
 const express = require('express');
 const router = express.Router();
 
 const axios = require('axios');
-const qs = require('qs');
 const { DateTime } = require('luxon');
 
 const { log } = require('../core/logger');
@@ -28,8 +25,6 @@ const {
   findUserByUPN,
   getUser,
   revokeUserSessions,
-  deleteUser,
-  getDeletedUser,
   updateUser
 } = require('../services/graphUser');
 
@@ -42,19 +37,14 @@ const {
   sendFailureMail
 } = require('../infra/email');
 
-/* ------------------------------ helpers & cfg ------------------------------ */
-
 const tz = process.env.TZ || 'Asia/Kolkata';
 
 function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
-function clamp(n, min, max) { return Math.min(Math.max(n, min), max); }
-
 function parseJoinDateIST(s, zone) {
   if (!s) return null;
   const dt = DateTime.fromFormat(String(s).trim(), 'dd-LL-yyyy', { zone: zone || tz });
   return dt.isValid ? dt : null;
 }
-
 function prefixForEmployeeType(t) {
   if (!t) return '';
   const s = String(t).toLowerCase();
@@ -62,12 +52,10 @@ function prefixForEmployeeType(t) {
   if (s.includes('intern')) return 'i-';
   return '';
 }
-
 function normNickname(first, last) {
   return `${String(first || '').toLowerCase()}.${String(last || '').toLowerCase()}`
     .replace(/[^a-z0-9.]/g, '');
 }
-
 function pick(obj, keys) {
   for (const k of keys) {
     if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== '') {
@@ -77,20 +65,11 @@ function pick(obj, keys) {
   return undefined;
 }
 
-/* --------------------------------- routes --------------------------------- */
-
 router.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-/**
- * Pre-hire webhook (Zoho Candidate edit) — schedule account create/ensure
- * - protected by HMAC
- * - dedupes active jobs
- * - optional provisional email back to Zoho when ZP_PROVISIONAL_UPDATE=true
- */
 router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {
-  const startedAt = new Date().toISOString();
   try {
     const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
     const { id, firstname, lastname, email, employeeId, joiningdate } = data;
@@ -103,7 +82,6 @@ router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {
       return res.status(400).json({ message: msg, received: data });
     }
 
-    // cooldown to suppress echo webhooks after success
     const cooldownMin = toInt(process.env.PREHIRE_COOLDOWN_MINUTES, 3);
     const untilStr = getKV(`CANDIDATE_COOLDOWN_UNTIL:${id}`);
     const until = untilStr ? Number(untilStr) : 0;
@@ -139,7 +117,6 @@ router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {
       reason = 'no-join->quick';
     }
 
-    // dedupe near-identical active job for this candidate
     const existing = findActiveJobByCandidate('createFromCandidate', id);
     if (existing) {
       const toleranceMs = 60 * 1000;
@@ -178,7 +155,6 @@ router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {
       }
     });
 
-    // optional provisional update back to Zoho
     if (String(process.env.ZP_PROVISIONAL_UPDATE || 'false').toLowerCase() === 'true') {
       try {
         const domain = process.env.OFFICIAL_EMAIL_DOMAIN || get('AZURE_DEFAULT_DOMAIN');
@@ -215,14 +191,7 @@ router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {
   }
 });
 
-/**
- * Profile edit webhook — partial patch of Azure user
- * - protected by HMAC
- * - resolves user by UPN/email/employeeId
- * - manager relation optional
- */
 router.post('/zoho-webhook/edit', verifySignature, async (req, res) => {
-  const startedAt = new Date().toISOString();
   try {
     const data = Object.keys(req.body || {}).length ? req.body : req.query;
 
@@ -286,7 +255,6 @@ router.post('/zoho-webhook/edit', verifySignature, async (req, res) => {
       }
     }
 
-    // manager linkage (best-effort)
     if (manager) {
       try {
         const managerCode = String(manager).split(' ').pop();
@@ -340,11 +308,6 @@ router.post('/zoho-webhook/edit', verifySignature, async (req, res) => {
   }
 });
 
-/**
- * Offboarding webhook — disable now or schedule disable at configured time on Date of Exit
- * - protected by HMAC
- * - verifies employeeId ownership when resolving by email/upn
- */
 router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
   try {
     const data = Object.keys(req.body || {}).length ? req.body : req.query;
@@ -368,11 +331,9 @@ router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
       ? new Date(exitDtIST.set({ hour: H, minute: M, second: 0, millisecond: 0 }).toUTC().toMillis())
       : null;
 
-    // immediate path (no date, or scheduled time already passed)
     if (!candidate || candidate.getTime() <= Date.now()) {
       const token = await getAzureAccessToken();
 
-      // lookup with employeeId verification
       let user = await findByEmployeeId(token, String(employeeId).trim());
       if (!user && email) {
         const byEmail = await findByEmail(token, String(email).trim());
@@ -390,12 +351,10 @@ router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
         return res.status(404).json({ message: msg, employeeId });
       }
 
-      // best-effort cleanup then disable account (soft offboard)
       try { await revokeUserSessions(token, user.id); } catch { }
       try {
         await updateUser(token, user.id, { accountEnabled: false });
 
-        // remove group memberships (best-effort)
         try {
           const groupsRes = await axios.get(
             `https://graph.microsoft.com/v1.0/users/${user.id}/memberOf?$select=id`,
@@ -412,7 +371,6 @@ router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
           }
         } catch { }
 
-        // drop manager link (best-effort)
         try {
           await axios.delete(
             `https://graph.microsoft.com/v1.0/users/${user.id}/manager/$ref`,
@@ -440,7 +398,6 @@ router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
       });
     }
 
-    // scheduled disable job
     const runAt = candidate.getTime();
     const jobId = upsertJob({
       type: 'disableUser',
@@ -468,10 +425,6 @@ router.post('/zoho-webhook/delete', verifySignature, async (req, res) => {
   }
 });
 
-/**
- * Employment type edit — add alias emails based on type
- * - protected by HMAC
- */
 router.post('/employee-type/edit', verifySignature, async (req, res) => {
   try {
     const { employeeId, type } = req.body || {};

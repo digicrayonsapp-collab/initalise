@@ -1,8 +1,12 @@
 'use strict';
-const axios = require('axios');
-const { attachRetry } = require('./core/retry');
+
 const express = require('express');
 const helmet = require('helmet');
+const axios = require('axios');
+const { attachRetry } = require('./core/retry');
+
+attachRetry(axios, { retries: 3, baseDelayMs: 300 });
+
 const { httpLogger, log } = require('./core/logger');
 const { AppError, toAppError } = require('./core/errors');
 const { initSQLite, markJob, setKV } = require('./infra/sqlite');
@@ -34,8 +38,6 @@ function mask(s) {
   s = String(s);
   return s.length <= 6 ? '***' : `${s.slice(0, 3)}…${s.slice(-3)}`;
 }
-attachRetry(axios, { retries: 3, baseDelayMs: 300 });
-
 log.info(
   'Azure env:',
   'tenant=', mask(process.env.AZURE_TENANT_ID),
@@ -63,11 +65,10 @@ async function executor(job) {
 
       const token = await getAzureAccessToken();
 
-      // If user already exists, mark done and emit a soft "already exists" email
       let existingUser = null;
-      try { existingUser = await findByEmployeeId(token, employeeId); } catch { }
+      try { existingUser = await findByEmployeeId(token, employeeId); } catch {}
       if (!existingUser && email) {
-        try { existingUser = await findByEmail(token, email); } catch { }
+        try { existingUser = await findByEmail(token, email); } catch {}
       }
       if (existingUser) {
         try {
@@ -76,8 +77,7 @@ async function executor(job) {
             const cooldownMs = Math.max(0, cooldownMin) * 60 * 1000;
             setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + cooldownMs));
           }
-        } catch { }
-
+        } catch {}
         markJob(job.id, {
           status: 'done',
           result: { action: 'already_exists', userId: existingUser?.id || null, upn: existingUser?.userPrincipalName || null }
@@ -89,7 +89,6 @@ async function executor(job) {
         return;
       }
 
-      // Generate/choose employeeId
       let effectiveEmployeeId = employeeId;
       if (!effectiveEmployeeId) {
         try {
@@ -101,7 +100,7 @@ async function executor(job) {
             const { setKV } = require('./infra/sqlite');
             setKV('EMPLOYEE_ID_SEQ', next);
           }
-        } catch { }
+        } catch {}
       }
       if (!effectiveEmployeeId) {
         try {
@@ -111,7 +110,7 @@ async function executor(job) {
             const next = bumpKVInt('EMPLOYEE_ID_SEQ');
             effectiveEmployeeId = String(next);
           }
-        } catch { }
+        } catch {}
       }
       if (!effectiveEmployeeId) {
         try {
@@ -120,7 +119,7 @@ async function executor(job) {
           effectiveEmployeeId = String(next);
           const n = parseInt(next, 10);
           if (Number.isFinite(n)) setKV('EMPLOYEE_ID_SEQ', n);
-        } catch { }
+        } catch {}
       }
 
       const empType = employeeType || employementType || null;
@@ -142,7 +141,7 @@ async function executor(job) {
           if (!isNaN(dt.getTime())) {
             await updateUser(token, result.userId, { employeeHireDate: dt.toISOString().replace(/\.\d{3}Z$/, 'Z') });
           }
-        } catch { }
+        } catch {}
       }
 
       if (candidateId) {
@@ -154,17 +153,16 @@ async function executor(job) {
           const fields = { [officialField]: official };
           if (effectiveEmployeeId) fields[empIdField] = String(effectiveEmployeeId);
           await updateCandidateFields({ recordId: candidateId, fields });
-        } catch { }
+        } catch {}
       }
 
-      // mark and email
       try {
         if (candidateId) {
           const cooldownMin = parseInt(process.env.PREHIRE_COOLDOWN_MINUTES || '3', 10);
           const cooldownMs = Math.max(0, cooldownMin) * 60 * 1000;
           setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + cooldownMs));
         }
-      } catch { }
+      } catch {}
 
       markJob(job.id, { status: 'done', result: { userId: result.userId, upn: result.upn, action: result.action } });
       await sendSuccessMail({
@@ -202,9 +200,8 @@ async function executor(job) {
         return;
       }
 
-      try { await getUser(token, user.id, 'id,userPrincipalName,employeeId,accountEnabled'); } catch { }
-
-      try { await revokeUserSessions(token, user.id); } catch { }
+      try { await getUser(token, user.id, 'id,userPrincipalName,employeeId,accountEnabled'); } catch {}
+      try { await revokeUserSessions(token, user.id); } catch {}
 
       try {
         await deleteUser(token, user.id);
@@ -215,8 +212,8 @@ async function executor(job) {
         return;
       }
 
-      try { await getUser(token, user.id, 'id'); } catch { }
-      try { await getDeletedUser(token, user.id); } catch { }
+      try { await getUser(token, user.id, 'id'); } catch {}
+      try { await getDeletedUser(token, user.id); } catch {}
 
       markJob(job.id, { status: 'done' });
       await sendSuccessMail({
@@ -273,11 +270,6 @@ async function executor(job) {
 function buildApp() {
   const app = express();
   app.use(helmet());
-  app.use(express.json({ limit: '1mb' }));
-  app.use(express.urlencoded({ extended: true }));
-  app.use(httpLogger);
-
-  app.use('/api', routes);
 
   app.use(express.json({
     limit: '1mb',
@@ -287,6 +279,16 @@ function buildApp() {
     extended: true,
     verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); }
   }));
+
+  app.use(httpLogger);
+  app.use('/api', routes);
+
+  app.use((req, res, next) => next(new AppError(404, 'Not Found')));
+  app.use((err, req, res, next) => {
+    const e = toAppError(err);
+    log.error('Error', e.message, e.details || '');
+    res.status(e.status || 500).json({ message: e.message, details: e.details });
+  });
   return app;
 }
 
@@ -299,7 +301,6 @@ async function bootstrap() {
   const port = parseInt(get('PORT', 3008), 10);
   app.listen(port, '0.0.0.0', () => log.info(`http://0.0.0.0:${port}`));
 
-  const { tickRunner } = require('./infra/scheduler');
   tickRunner(executor);
 }
 

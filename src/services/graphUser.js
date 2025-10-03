@@ -2,9 +2,7 @@
 
 const axios = require('axios');
 const { get } = require('../config/env');
-const axios = require("axios");
-const { get } = require("../config/env");
-const { attachRetry } = require("../core/retry");
+const { attachRetry } = require('../core/retry');
 
 const graphHttp = axios.create({ baseURL: 'https://graph.microsoft.com/v1.0' });
 attachRetry(graphHttp, { retries: 3, baseDelayMs: 300 });
@@ -22,29 +20,37 @@ graphHttp.interceptors.request.use((config) => {
     return config;
   }
 
-  if (typeof config.data !== 'string') config.data = JSON.stringify(config.data);
+  if (typeof config.data !== 'string') {
+    config.data = JSON.stringify(config.data);
+  }
   config.headers['Content-Type'] = 'application/json';
   return config;
 });
 
-/* --------------------------------- helpers -------------------------------- */
-
+/* --------------------------------- helpers --------------------------------- */
 function escapeOdataValue(v) {
   return String(v).replace(/'/g, "''");
 }
 
 async function graphGet(token, path, params = {}) {
-  const res = await graphHttp.get(path, { headers: { Authorization: `Bearer ${token}` }, params });
+  const res = await graphHttp.get(path, {
+    headers: { Authorization: `Bearer ${token}` },
+    params
+  });
   return res.data;
 }
 
 async function graphPost(token, path, body) {
-  const res = await graphHttp.post(path, body ?? {}, { headers: { Authorization: `Bearer ${token}` } });
+  const res = await graphHttp.post(path, body ?? {}, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
   return res.data;
 }
 
 async function graphPatch(token, path, body) {
-  const res = await graphHttp.patch(path, body ?? {}, { headers: { Authorization: `Bearer ${token}` } });
+  const res = await graphHttp.patch(path, body ?? {}, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
   return res.data;
 }
 
@@ -66,7 +72,7 @@ function stripUndefined(obj) {
   return out;
 }
 
-/* --------------------------------- CRUD ----------------------------------- */
+/* ------------------------------- CRUD helpers ------------------------------ */
 
 async function deleteUser(token, id) {
   await graphHttp.delete(`/users/${encodeURIComponent(id)}`, {
@@ -105,7 +111,7 @@ async function revokeUserSessions(token, id) {
   return 204;
 }
 
-/* -------------------------------- lookups --------------------------------- */
+/* --------------------------------- lookups --------------------------------- */
 
 async function findUserByUPN(token, upn) {
   const data = await graphGet(token, '/users', {
@@ -116,7 +122,8 @@ async function findUserByUPN(token, upn) {
 }
 
 function normNickname(firstname, lastname) {
-  return `${(firstname || '').toLowerCase()}.${(lastname || '').toLowerCase()}`.replace(/[^a-z0-9.]/g, '');
+  return `${(firstname || '').toLowerCase()}.${(lastname || '').toLowerCase()}`
+    .replace(/[^a-z0-9.]/g, '');
 }
 
 async function ensureUniquePrincipal(token, baseLocalPart, domain) {
@@ -130,7 +137,9 @@ async function ensureUniquePrincipal(token, baseLocalPart, domain) {
     const local = i === 0 ? base : `${base}${i}`;
     const upn = `${local}@${domain}`;
     const resp = await graphGet(token, '/users', {
-      $filter: `(userPrincipalName eq '${escapeOdataValue(upn)}') or (mailNickname eq '${escapeOdataValue(local)}')`,
+      $filter:
+        `(userPrincipalName eq '${escapeOdataValue(upn)}') or ` +
+        `(mailNickname eq '${escapeOdataValue(local)}')`,
       $select: 'id'
     });
     if (!resp.value || resp.value.length === 0) {
@@ -264,13 +273,14 @@ async function upsertUser(token, data) {
   }
 
   const { upn, mailNickname } = await ensureUniquePrincipal(token, nickBase, domain);
+  const tempPass = process.env.AAD_DEFAULT_TEMP_PASSWORD || 'TempPass123!';
 
   const createBody = stripUndefined({
     accountEnabled: true,
     displayName: `${data.firstname || ''} ${data.lastname || ''}`.trim(),
     mailNickname,
     userPrincipalName: upn,
-    passwordProfile: { forceChangePasswordNextSignIn: true, password: 'TempPass123!' },
+    passwordProfile: { forceChangePasswordNextSignIn: true, password: tempPass },
     otherMails: data.email ? [String(data.email).trim()] : undefined,
     givenName: data.firstname || undefined,
     surname: data.lastname || undefined,
@@ -289,12 +299,10 @@ async function upsertUser(token, data) {
   return { action: 'created', userId: created.id, upn };
 }
 
-// replace findUserByDisplayName in src/services/graphUser.js
 async function findUserByDisplayName(token, displayName) {
   try {
-    const val = String(displayName || '').replace(/'/g, "''");
     const data = await graphGet(token, '/users', {
-      $filter: `displayName eq '${val}'`,
+      $filter: `displayName eq '${escapeOdataValue(displayName)}'`,
       $select: 'id,userPrincipalName,displayName,employeeId,mail'
     });
     return (data.value && data.value[0]) || null;
