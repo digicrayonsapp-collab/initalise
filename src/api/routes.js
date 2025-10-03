@@ -4,11 +4,12 @@ const express = require('express');
 const router = express.Router();
 
 const { log } = require('../core/logger');
-const { upsertJob, markJob, findActiveJobByCandidate, getKV } = require('../infra/sqlite');
+const { upsertJob, markJob } = require('../infra/sqlite');
 const { getInt, get } = require('../config/env');
 const { getAzureAccessToken } = require('../services/graphAuth');
 const { DateTime } = require('luxon');
 const axios = require('axios');
+const qs = require('qs');
 
 const {
   findByEmployeeId,
@@ -21,7 +22,9 @@ const {
   updateUser
 } = require('../services/graphUser');
 
+const { findActiveJobByCandidate, getKV } = require('../infra/sqlite');
 const { updateCandidateOfficialEmail } = require('../services/zohoPeople');
+
 const { sendSuccessMail, sendFailureMail } = require('../infra/email');
 
 const tz = process.env.TZ || 'Asia/Kolkata';
@@ -34,6 +37,7 @@ function parseJoinDateIST(s, zone) {
   const dt = DateTime.fromFormat(String(s).trim(), 'dd-LL-yyyy', { zone: zone || tz });
   return dt.isValid ? dt : null;
 }
+
 function prefixForEmployeeType(t) {
   if (!t) return '';
   const s = String(t).toLowerCase();
@@ -41,14 +45,14 @@ function prefixForEmployeeType(t) {
   if (s.includes('intern')) return 'i-';
   return '';
 }
+
 function normNickname(first, last) {
-  return `${String(first || '').toLowerCase()}.${String(last || '').toLowerCase()}`
-    .replace(/[^a-z0-9.]/g, '');
+  return `${String(first || '').toLowerCase()}.${String(last || '').toLowerCase()}`.replace(/[^a-z0-9.]/g, '');
 }
 
-router.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-
-/* ------------------------- prehire: candidate ----------------------- */
+router.get('/health', (req, res) =>
+  res.json({ status: 'ok', time: new Date().toISOString() })
+);
 
 router.post('/zoho-candidate/edit', async (req, res) => {
   const startedAt = new Date().toISOString();
@@ -57,21 +61,17 @@ router.post('/zoho-candidate/edit', async (req, res) => {
     const { id, firstname, lastname, email, employeeId, joiningdate } = data;
     const employeeType = data.employeeType;
 
-    log.info('[prehire] request', { startedAt, keys: Object.keys(data), employeeType, id, firstname, lastname, joiningdate });
-
     if (!id || !firstname || !lastname) {
       const msg = 'Missing firstname, lastname, or candidate ID';
       await sendFailureMail({ subject: 'PREHIRE schedule failed', text: msg });
       return res.status(400).json({ message: msg, received: data });
     }
 
-    // Cool-down on candidate id to avoid echo loops
     const cooldownMin = toInt(process.env.PREHIRE_COOLDOWN_MINUTES, 3);
     const untilStr = getKV(`CANDIDATE_COOLDOWN_UNTIL:${id}`);
     const until = untilStr ? Number(untilStr) : 0;
     if (until && Date.now() < until) {
       const msLeft = until - Date.now();
-      log.info('[prehire] cooldown', { candidateId: id, msLeft });
       return res.json({ message: 'cooldown_active', candidateId: id, retryAfterMs: msLeft });
     }
 
@@ -81,18 +81,13 @@ router.post('/zoho-candidate/edit', async (req, res) => {
     const prehireDays = toInt(process.env.PREHIRE_OFFSET_DAYS, 5);
 
     const joinDtIST = parseJoinDateIST(joiningdate, tz);
+    let runAtDate, reason;
     const nowIST = DateTime.now().setZone(tz);
 
-    let runAtDate, reason;
     if (joinDtIST) {
       const prehireIST = joinDtIST.minus({ days: prehireDays }).set({ hour: execHour, minute: execMin, second: 0, millisecond: 0 });
-      if (prehireIST > nowIST) {
-        runAtDate = new Date(prehireIST.toUTC().toMillis());
-        reason = `prehire-${prehireDays}d`;
-      } else {
-        runAtDate = new Date(nowIST.plus({ minutes: quickMins }).toUTC().toMillis());
-        reason = 'prehire-in-past->quick';
-      }
+      if (prehireIST > nowIST) { runAtDate = new Date(prehireIST.toUTC().toMillis()); reason = `prehire-${prehireDays}d`; }
+      else { runAtDate = new Date(nowIST.plus({ minutes: quickMins }).toUTC().toMillis()); reason = 'prehire-in-past->quick'; }
     } else {
       runAtDate = new Date(nowIST.plus({ minutes: quickMins }).toUTC().toMillis());
       reason = 'no-join->quick';
@@ -103,7 +98,6 @@ router.post('/zoho-candidate/edit', async (req, res) => {
       const toleranceMs = 60 * 1000;
       if (Math.abs(existing.runAt - runAtDate.getTime()) <= toleranceMs) {
         const runAtIstExisting = DateTime.fromMillis(existing.runAt).setZone(tz).toFormat('dd-LL-yyyy HH:mm:ss ZZZZ');
-        log.info('[prehire] duplicate suppressed', { job: existing, runAtIstExisting });
         return res.json({
           message: 'already_scheduled',
           jobId: existing.id,
@@ -112,11 +106,7 @@ router.post('/zoho-candidate/edit', async (req, res) => {
           runAtIST: runAtIstExisting
         });
       }
-      markJob(existing.id, {
-        status: 'cancelled',
-        lastError: 'superseded by new schedule',
-        result: { supersededBy: { runAt: runAtDate.getTime() } }
-      });
+      markJob(existing.id, { status: 'cancelled', lastError: 'superseded by new schedule', result: { supersededBy: { runAt: runAtDate.getTime() } } });
     }
 
     const jobId = upsertJob({
@@ -140,9 +130,8 @@ router.post('/zoho-candidate/edit', async (req, res) => {
         const pref = prefixForEmployeeType(employeeType);
         const provisional = `${pref}${local}@${domain}`;
         await updateCandidateOfficialEmail({ recordId: id, officialEmail: provisional });
-        log.info('[prehire] provisional Zoho email set', { provisional });
       } catch (zerr) {
-        log.warn('[prehire] provisional Zoho update failed', zerr?.response?.data || zerr?.message || zerr);
+        log.warn({ err: zerr?.response?.data || zerr?.message || zerr }, '[prehire] provisional Zoho update failed');
       }
     }
 
@@ -163,18 +152,13 @@ router.post('/zoho-candidate/edit', async (req, res) => {
     });
   } catch (error) {
     const details = error?.response?.data || error.message;
-    log.error('[prehire] error', details);
     await sendFailureMail({ subject: 'PREHIRE schedule failed', text: String(details || 'unknown error') });
     return res.status(500).json({ message: 'Failed to process webhook', error: details });
   }
 });
 
-/* --------------------------- edit: profile patch --------------------------- */
-
 router.post('/zoho-webhook/edit', async (req, res) => {
   const startedAt = new Date().toISOString();
-  log.info('[edit] hit', { ts: startedAt, ip: req.ip, ua: req.get('user-agent') });
-
   try {
     const data = Object.keys(req.body || {}).length ? req.body : req.query;
     const upn = data.userPrincipalName || data.upn || data.Other_Email || data['Other Email'] || data.otherEmail;
@@ -209,7 +193,6 @@ router.post('/zoho-webhook/edit', async (req, res) => {
       return res.status(404).json({ message: msg, tried: { upn: upn || null, email: email || null, employeeId: employeeId || null } });
     }
 
-    // Use otherMails (mail is read-only)
     const patch = {
       displayName: (firstname || lastname) ? `${firstname || user.givenName || ''} ${lastname || user.surname || ''}`.trim() : undefined,
       givenName: firstname || undefined,
@@ -231,7 +214,7 @@ router.post('/zoho-webhook/edit', async (req, res) => {
         const [dd, mm, yyyy] = String(joiningdate).split('-');
         const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
         if (!isNaN(dt.getTime())) patch.employeeHireDate = dt.toISOString().replace(/\.\d{3}Z$/, 'Z');
-      } catch (e) { log.warn('[edit] failed to parse joiningdate', e.message); }
+      } catch (e) { }
     }
 
     if (manager) {
@@ -245,17 +228,15 @@ router.post('/zoho-webhook/edit', async (req, res) => {
             { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
           );
         } else {
-          log.warn('[edit] manager not found in Azure by employeeId', manager);
+          log.warn({ manager }, '[edit] manager not found by employeeId');
         }
       } catch (err) {
-        log.warn('[edit] manager update failed', err?.response?.data || err?.message || err);
+        log.warn({ err: err?.response?.data || err?.message || err }, '[edit] manager update failed');
       }
     }
 
     Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
-    if (Object.keys(patch).length) {
-      await updateUser(token, user.id, patch);
-    }
+    if (Object.keys(patch).length) await updateUser(token, user.id, patch);
 
     await sendSuccessMail({
       subject: 'EDIT succeeded',
@@ -272,25 +253,22 @@ router.post('/zoho-webhook/edit', async (req, res) => {
     });
   } catch (err) {
     const details = err?.response?.data || err?.message || String(err);
-    log.error('[edit] failed', details);
     await sendFailureMail({ subject: 'EDIT failed', text: String(details) });
     return res.status(500).json({ message: 'Failed to update Azure user', details });
   }
 });
 
-/* --------------------------- offboarding delete --------------------------- */
-
 router.post('/zoho-webhook/delete', async (req, res) => {
   const startedAt = new Date().toISOString();
-  log.info('[delete] hit', { ts: startedAt, ip: req.ip, ua: req.get('user-agent') });
-
   try {
     const data = Object.keys(req.body || {}).length ? req.body : req.query;
 
-    const employeeId = ['employeeId', 'EmployeeID', 'EmpID', 'Emp Id', 'empId'].map(k => data[k]).find(v => v !== undefined);
-    const email = ['email', 'mail', 'Email'].map(k => data[k]).find(v => v !== undefined);
-    const upn = ['userPrincipalName', 'upn', 'Other_Email', 'Other Email', 'otherEmail'].map(k => data[k]).find(v => v !== undefined);
-    const exitDateRaw = ['dateOFExit', 'dateOfExit', 'Date_of_Exit', 'Date of Exit', 'dateofexit', 'exitDate'].map(k => data[k]).find(v => v !== undefined);
+    const pick = (obj, keys) => keys.map((k) => obj[k]).find((v) => v !== undefined);
+
+    const employeeId = pick(data, ['employeeId', 'EmployeeID', 'EmpID', 'Emp Id', 'empId']);
+    const email = pick(data, ['email', 'mail', 'Email']);
+    const upn = pick(data, ['userPrincipalName', 'upn', 'Other_Email', 'Other Email', 'otherEmail']);
+    const exitDateRaw = pick(data, ['dateOFExit', 'dateOfExit', 'Date_of_Exit', 'Date of Exit', 'dateofexit', 'exitDate']);
 
     if (!employeeId) {
       const msg = 'employeeId is required';
@@ -301,10 +279,13 @@ router.post('/zoho-webhook/delete', async (req, res) => {
     const H = getInt('OFFBOARD_EXEC_HOUR', 14);
     const M = getInt('OFFBOARD_EXEC_MIN', 20);
     const exitDtIST = parseJoinDateIST(exitDateRaw, tz);
-    const candidate = exitDtIST ? new Date(exitDtIST.set({ hour: H, minute: M, second: 0, millisecond: 0 }).toUTC().toMillis()) : null;
+    const candidate = exitDtIST
+      ? new Date(exitDtIST.set({ hour: H, minute: M, second: 0, millisecond: 0 }).toUTC().toMillis())
+      : null;
 
     if (!candidate || candidate.getTime() <= Date.now()) {
       const token = await getAzureAccessToken();
+
       let user = await findByEmployeeId(token, String(employeeId).trim());
       if (!user && email) {
         const byEmail = await findByEmail(token, String(email).trim());
@@ -314,30 +295,31 @@ router.post('/zoho-webhook/delete', async (req, res) => {
         const byUpn = await findUserByUPN(token, String(upn).trim());
         if (byUpn && String(byUpn.employeeId ?? '').trim() === String(employeeId).trim()) user = byUpn;
       }
-
       if (!user) {
         const msg = 'Azure user not found with matching employeeId';
         await sendFailureMail({ subject: 'DELETE failed (not found)', text: msg });
         return res.status(404).json({ message: msg, employeeId });
       }
 
-      try { await revokeUserSessions(token, user.id); } catch {}
+      try { await revokeUserSessions(token, user.id); } catch { }
       try {
         await updateUser(token, user.id, { accountEnabled: false });
-
-        // remove from groups
         try {
-          const groupsRes = await axios.get(`https://graph.microsoft.com/v1.0/users/${user.id}/memberOf?$select=id`, { headers: { Authorization: `Bearer ${token}` } });
+          const groupsRes = await axios.get(
+            `https://graph.microsoft.com/v1.0/users/${user.id}/memberOf?$select=id`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           const groups = groupsRes.data.value || [];
           for (const g of groups) {
-            try { await axios.delete(`https://graph.microsoft.com/v1.0/groups/${g.id}/members/${user.id}/$ref`, { headers: { Authorization: `Bearer ${token}` } }); }
-            catch (err) { log.warn('[delete] group remove failed', { group: g.id, err: err?.response?.data || err?.message }); }
+            try {
+              await axios.delete(
+                `https://graph.microsoft.com/v1.0/groups/${g.id}/members/${user.id}/$ref`,
+                { headers: { Authorization: `Bearer ${token}` } }
+              );
+            } catch (err) { }
           }
-        } catch (e) { log.warn('[delete] remove groups failed', e?.message); }
-
-        try { await axios.delete(`https://graph.microsoft.com/v1.0/users/${user.id}/manager/$ref`, { headers: { Authorization: `Bearer ${token}` } }); }
-        catch (e) { log.warn('[delete] remove manager failed', e?.message); }
-
+        } catch (e) { }
+        try { await axios.delete(`https://graph.microsoft.com/v1.0/users/${user.id}/manager/$ref`, { headers: { Authorization: `Bearer ${token}` } }); } catch { }
       } catch (e) {
         const details = e?.response?.data || e?.message || e;
         await sendFailureMail({ subject: 'DELETE failed (update)', text: String(details) });
@@ -373,17 +355,12 @@ router.post('/zoho-webhook/delete', async (req, res) => {
     });
   } catch (e) {
     const details = e?.response?.data || e?.message || String(e);
-    log.error('[delete] failed', details);
     await sendFailureMail({ subject: 'DELETE failed (exception)', text: String(details) });
     return res.status(500).json({ message: 'Internal Server Error', details });
   }
 });
 
-/* ---------------------- employment type alias helper ---------------------- */
-
 router.post('/employee-type/edit', async (req, res) => {
-  log.info('[emp-type] hit', { ts: new Date().toISOString(), ip: req.ip, ua: req.get('user-agent') });
-
   try {
     const { employeeId, type } = req.body || {};
     if (!employeeId || !type) {
@@ -416,7 +393,6 @@ router.post('/employee-type/edit', async (req, res) => {
 
   } catch (e) {
     const details = e?.response?.data || e?.message || e;
-    log.error('[emp-type] failed', details);
     await sendFailureMail({ subject: 'EMP-TYPE failed', text: String(details) });
     return res.status(500).json({ message: 'Internal Server Error', details });
   }
