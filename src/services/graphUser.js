@@ -2,8 +2,12 @@
 
 const axios = require('axios');
 const { get } = require('../config/env');
+const axios = require("axios");
+const { get } = require("../config/env");
+const { attachRetry } = require("../core/retry");
 
 const graphHttp = axios.create({ baseURL: 'https://graph.microsoft.com/v1.0' });
+attachRetry(graphHttp, { retries: 3, baseDelayMs: 300 });
 
 graphHttp.interceptors.request.use((config) => {
   config.headers = config.headers || {};
@@ -285,16 +289,17 @@ async function upsertUser(token, data) {
   return { action: 'created', userId: created.id, upn };
 }
 
+// replace findUserByDisplayName in src/services/graphUser.js
 async function findUserByDisplayName(token, displayName) {
   try {
-    const name = String(displayName || '').trim().replace(/'/g, "''");
+    const val = String(displayName || '').replace(/'/g, "''");
     const data = await graphGet(token, '/users', {
-      $filter: `displayName eq '${name}'`,
-      $select: 'id,userPrincipalName,mail,employeeId,accountEnabled,displayName'
+      $filter: `displayName eq '${val}'`,
+      $select: 'id,userPrincipalName,displayName,employeeId,mail'
     });
     return (data.value && data.value[0]) || null;
   } catch (err) {
-    console.error('findUserByDisplayName failed:', err?.response?.data || err.message || String(err));
+    console.error('findUserByDisplayName failed:', err?.response?.data || err?.message || String(err));
     return null;
   }
 }
