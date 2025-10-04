@@ -1,0 +1,256 @@
+﻿        },
+        timeout: 15000
+      }
+    );
+
+    emitSafe('sync:success', { action: 'prehire-provisional-email', candidate_id: id, email: officialEmail });
+    await mailSuccess('PREHIRE provisional email set', `candidateId=${id}\nemail=${officialEmail}`);
+
+    return res.status(200).json({
+      message: 'Official email generated and updated in Candidate record',
+      officialEmail,
+      employeeType,
+      zohoResponse: zohoRes.data
+    });
+  } catch (error) {
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[PREHIRE] processing failed:', details);
+    emitSafe('sync:failure', { action: 'prehire-provisional-email', error: details });
+    await mailFailure('PREHIRE provisional email failed', String(details));
+    return res.status(500).json({ message: 'Failed to process webhook', error: details });
+  }
+});
+
+/**
+ * Create user in Azure AD from Zoho webhook, ensuring unique UPN and prefix by employee type.
+ */
+app.post('/zoho-webhook/create', async (req, res) => {
+  try {
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+    const {
+      email, firstname, lastname, employeeId, city, manager, joiningdate,
+      company, zohoRole, mobilePhone, employementType, workPhone,
+      employeeStatus, country, department, officelocation
+    } = data;
+
+    if (!firstname || !lastname) {
+      return res.status(400).json({
+        message: 'Missing firstname or lastname in webhook payload',
+        receivedKeys: Object.keys(data || {})
+      });
+    }
+
+    const accessToken = await getAzureAccessToken();
+    const rawNick = normNickname(firstname, lastname);
+    const pref = prefixForEmployeeType(employementType);
+    const safeNickname = (pref ? `${pref}${rawNick}` : rawNick);
+
+    const domain = (get('AZURE_DEFAULT_DOMAIN') || 'example.onmicrosoft.com').trim();
+
+    // Unique UPN loop
+    let userPrincipalName = `${safeNickname}@${domain}`;
+    let counter = 1;
+    while (true) {
+      const filter = `$filter=userPrincipalName eq '${odataQuote(userPrincipalName)}'`;
+      const check = await axios.get(
+        `https://graph.microsoft.com/v1.0/users?${encodeURI(filter)}`,
+        { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
+      );
+      if (!check.data.value || check.data.value.length === 0) break;
+      userPrincipalName = `${safeNickname}${counter}@${domain}`;
+      counter += 1;
+      if (counter > 50) throw new Error('exhausted upn attempts');
+    }
+
+    const tempPassword = get('GRAPH_TEMP_PASSWORD', 'TempPass123!');
+    const createBody = {
+      accountEnabled: true,
+      displayName: `${firstname} ${lastname}`.trim(),
+      mailNickname: userPrincipalName.split('@')[0],
+      userPrincipalName,
+      passwordProfile: { forceChangePasswordNextSignIn: true, password: tempPassword },
+      // 'mail' is read-only; use otherMails to store external email
+      otherMails: email ? [String(email).trim()] : undefined,
+      givenName: firstname || undefined,
+      surname: lastname || undefined,
+      employeeId: employeeId || undefined,
+      country: country || undefined,
+      city: city || undefined,
+      mobilePhone: mobilePhone || undefined,
+      department: department || undefined,
+      jobTitle: zohoRole || undefined,
+      companyName: company || undefined,
+      employeeType: employementType || undefined,
+      officeLocation: officelocation || undefined
+    };
+
+    const createRes = await axios.post(
+      'https://graph.microsoft.com/v1.0/users',
+      createBody,
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 20000 }
+    );
+
+    if (joiningdate) {
+      try {
+        const [dd, mm, yyyy] = String(joiningdate).split('-');
+        const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
+        if (!isNaN(dt.getTime())) {
+          const hireISO = dt.toISOString().replace(/\.\d{3}Z$/, 'Z');
+          await axios.patch(
+            `https://graph.microsoft.com/v1.0/users/${createRes.data.id}`,
+            { employeeHireDate: hireISO },
+            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+          );
+        }
+      } catch (e) {
+        console.warn('[CREATE] failed to set employeeHireDate:', e && (e.message || String(e)));
+      }
+    }
+
+    emitSafe('sync:success', { action: 'user-create', upn: userPrincipalName, employee_id: employeeId, details: { id: createRes.data.id } });
+    await mailSuccess('CREATE user', `userId=${createRes.data.id}\nupn=${userPrincipalName}`);
+
+    return res.status(200).json({ message: 'User successfully created in Azure AD', azureUser: createRes.data });
+  } catch (error) {
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[CREATE] failed:', details);
+    emitSafe('sync:failure', { action: 'user-create', error: details });
+    await mailFailure('CREATE user failed', String(details));
+    return res.status(500).json({ message: 'Failed to create user in Azure AD', error: details });
+  }
+});
+
+/**
+ * Offboarding: schedule disable at OFFBOARD_EXEC_HOUR:MIN IST on exit date, or soon if missing/past.
+ * Make sure the scheduler (below) is running to consume the job.
+ */
+app.post('/zoho-webhook/delete', (req, res) => {
+  try {
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+
+    const upn = data.userPrincipalName || data.upn || data.Other_Email || data['Other Email'] || data.otherEmail;
+    const { email, employeeId } = data;
+
+    const exitDateRaw =
+      data.dateOfExit || data.Date_of_Exit || data['Date of Exit'] ||
+      data.dateofexit || data.dateOFExit || data.exitDate;
+
+    const execH = clamp(getInt('OFFBOARD_EXEC_HOUR', 14), 0, 23);
+    const execM = clamp(getInt('OFFBOARD_EXEC_MIN', 20), 0, 59);
+    const quickMins = toInt(process.env.OFFBOARD_OFFSET_MINUTES, 1);
+
+    const exitDtIST = parseJoinDateIST(exitDateRaw, TZ);
+    let runAtDate;
+    if (exitDtIST) {
+      const targetIST = exitDtIST.set({ hour: execH, minute: execM, second: 0, millisecond: 0 });
+      const candidate = new Date(targetIST.toUTC().toMillis());
+      runAtDate = (candidate.getTime() <= Date.now())
+        ? new Date(Date.now() + quickMins * 60 * 1000)
+        : candidate;
+    } else {
+      runAtDate = new Date(Date.now() + quickMins * 60 * 1000);
+    }
+
+    const runAt = runAtDate.getTime();
+    const jobId = upsertJob({
+      type: 'disableUser',
+      runAt,
+      payload: { upn: upn || null, email: email || null, employeeId: employeeId || null }
+    });
+
+    mailSuccess('OFFBOARD scheduled', `employeeId=${employeeId || ''}\nrunAtUTC=${new Date(runAt).toISOString()}`).catch(() => {});
+    emitSafe('sync:success', { action: 'user-disable-scheduled', employee_id: employeeId, upn });
+
+    return res.json({
+      message: 'scheduled',
+      jobId,
+      runAt: new Date(runAt).toISOString(),
+      computedFrom: exitDtIST ? 'exitDate-IST' : 'no-exitDate-immediate',
+      exitDateIST: exitDtIST ? exitDtIST.toISODate() : null,
+      execAtIST: `${String(execH).padStart(2, '0')}:${String(execM).padStart(2, '0')}`,
+      quickFallbackMinutes: (!exitDtIST || runAtDate.getTime() <= Date.now()) ? quickMins : null
+    });
+  } catch (e) {
+    console.error('[OFFBOARD] scheduling failed:', e && (e.stack || e.message || e));
+    mailFailure('OFFBOARD scheduling failed', e && (e.message || String(e))).catch(() => {});
+    return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
+/* -------------------------- scheduler + executor --------------------------- */
+
+const graph = (() => {
+  try { return require('./src/services/graphUser'); }
+  catch { return {}; }
+})();
+const graphAuth = (() => {
+  try { return require('./src/services/graphAuth'); }
+  catch { return { getAzureAccessToken: getAzureAccessToken }; }
+})();
+const zoho = (() => {
+  try { return require('./src/services/zohoPeople'); }
+  catch { return {}; }
+})();
+
+async function executor(job) {
+  const payload = typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {});
+  const type = String(job.type || '').toLowerCase();
+  const tz = TZ;
+
+  const nowUtc = new Date().toISOString();
+  const nowIst = DateTime ? DateTime.now().setZone(tz).toFormat('dd-LL-yyyy HH:mm:ss ZZZZ') : 'n/a';
+  console.log(`[JOB] start id=${job.id} type=${type} utc=${nowUtc} ist=${nowIst}`);
+
+  // helper for emails
+  async function note(ok, subject, body) {
+    try {
+      if (ok) await mailSuccess(subject, body);
+      else await mailFailure(subject, body);
+    } catch {}
+  }
+
+  // create/createFromCandidate
+  if (type === 'create' || type === 'createfromcandidate') {
+    try {
+      const {
+        firstname, lastname, email, employeeId, domain, candidateId,
+        country, city, mobilePhone, department, zohoRole, company,
+        employementType, employeeType, officelocation, joiningdate
+      } = payload;
+
+      const token = await graphAuth.getAzureAccessToken();
+
+      // if employeeId present, try existing
+      let existing = null;
+      if (employeeId && graph.findByEmployeeId) {
+        try { existing = await graph.findByEmployeeId(token, String(employeeId).trim()); }
+        catch (e) { console.warn('[JOB:create] findByEmployeeId failed:', e && (e.message || String(e))); }
+      }
+      if (!existing && email && graph.findByEmail) {
+        try { existing = await graph.findByEmail(token, String(email).trim()); }
+        catch (e) { console.warn('[JOB:create] findByEmail failed:', e && (e.message || String(e))); }
+      }
+      if (existing) {
+        // cooldown to suppress echo webhooks
+        if (candidateId) {
+          const mins = toInt(process.env.PREHIRE_COOLDOWN_MINUTES, 3);
+          setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + Math.max(0, mins) * 60 * 1000));
+        }
+        markJob(job.id, { status: 'done', result: { action: 'already_exists', userId: existing.id, upn: existing.userPrincipalName } });
+        await note(true, 'CREATE skipped (already exists)', `userId=${existing.id}\nupn=${existing.userPrincipalName}`);
+        return;
+      }
+
+      // upsert (create with proper prefix and uniqueness)
+      const empType = employeeType || employementType || null;
+      const resUpsert = await graph.upsertUser(token, {
+        firstname, lastname, email,
+        employeeId,
+        domain: domain || get('AZURE_DEFAULT_DOMAIN'),
+        country, city, mobilePhone, department, zohoRole, company,
+        employeeType: empType,
+        employementType: empType,
+        officelocation
+      });
+
+      // optional hire date

@@ -1,0 +1,256 @@
+﻿'use strict';
+require('dotenv').config();
+
+const express = require('express');
+const axios = require('axios');
+const qs = require('qs');
+
+const app = express();
+const PORT = Number(process.env.PORT || 3008);
+
+/* ----------------------------- infrastructure ------------------------------ */
+const { initBus, bus } = (() => {
+  try { return require('./src/core/bus'); }
+  catch { return { initBus: () => {}, bus: null }; }
+})();
+
+const {
+  upsertJob,
+  markJob,
+  getKV,
+  setKV,
+  findActiveJobByCandidate
+} = (() => {
+  try { return require('./src/infra/sqlite'); }
+  catch {
+    return {
+      upsertJob: () => Date.now(),
+      markJob: () => {},
+      getKV: () => null,
+      setKV: () => {},
+      findActiveJobByCandidate: () => null
+    };
+  }
+})();
+
+const { tickRunner } = (() => {
+  try { return require('./src/infra/scheduler'); }
+  catch { return { tickRunner: () => {} }; }
+})();
+
+const { get, getInt } = (() => {
+  try { return require('./src/config/env'); }
+  catch {
+    return {
+      get: (k, d) => process.env[k] ?? d,
+      getInt: (k, d) => {
+        const n = parseInt(process.env[k], 10);
+        return Number.isFinite(n) ? n : d;
+      }
+    };
+  }
+})();
+
+// optional mailer; if absent, emailing no-ops safely
+let sendMail = null;
+try { ({ sendMail } = require('./src/infra/email')); } catch {}
+
+const EMAIL_MODE = (get('EMAIL_MODE', 'event') || 'event').toLowerCase();
+const EMAIL_SUBJECT_PREFIX = get('EMAIL_SUBJECT_PREFIX', '[Zoho-Azure Sync]');
+const TO_SUCCESS = (get('EMAIL_TO_SUCCESS', '') || '').trim();
+const TO_FAILURE = (get('EMAIL_TO_FAILURE', '') || '').trim();
+const mailEnabled = !!sendMail && EMAIL_MODE !== 'off';
+
+/* --------------------------------- express --------------------------------- */
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+initBus();
+
+/* --------------------------------- helpers --------------------------------- */
+const { DateTime } = (() => {
+  try { return require('luxon'); }
+  catch { return { DateTime: null }; }
+})();
+
+function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+function clamp(n, min, max) { return Math.min(Math.max(n, min), max); }
+const TZ = process.env.TZ || 'Asia/Kolkata';
+
+function parseJoinDateIST(s, zone = TZ) {
+  if (!s || !DateTime) return null;
+  const dt = DateTime.fromFormat(String(s).trim(), 'dd-LL-yyyy', { zone });
+  return dt.isValid ? dt : null;
+}
+
+function _normKey(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+function pickWithKey(obj, aliases = []) {
+  if (!obj) return { value: undefined, matchedKey: null };
+  const lut = {};
+  for (const [k, v] of Object.entries(obj)) lut[_normKey(k)] = { v, k };
+  for (const a of aliases) {
+    const hit = lut[_normKey(a)];
+    if (hit && hit.v !== undefined && hit.v !== null && String(hit.v).trim() !== '') {
+      return { value: hit.v, matchedKey: hit.k };
+    }
+  }
+  return { value: undefined, matchedKey: null };
+}
+
+function normNickname(first, last) {
+  return `${String(first || '').toLowerCase()}.${String(last || '').toLowerCase()}`
+    .replace(/[^a-z0-9.]/g, '');
+}
+
+function prefixForEmployeeType(t) {
+  if (!t) return '';
+  const s = String(t).toLowerCase();
+  if (s.includes('contractor')) return 'c-';
+  if (s.includes('intern')) return 'i-';
+  return '';
+}
+
+function odataQuote(str) { return String(str).replace(/'/g, "''"); }
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[c]);
+}
+
+function emitSafe(event, payload) {
+  try { if (bus && bus.emit) bus.emit(event, payload); } catch {}
+}
+
+async function mailSuccess(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_SUCCESS) return;
+  try {
+    await sendMail({
+      to: TO_SUCCESS,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre style="font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">${escapeHtml(body)}</pre>`
+    });
+  } catch (e) {
+    console.warn('[MAIL] success email failed:', e && (e.message || String(e)));
+  }
+}
+
+async function mailFailure(subject, body) {
+  if (!mailEnabled || (EMAIL_MODE !== 'event' && EMAIL_MODE !== 'both') || !TO_FAILURE) return;
+  try {
+    await sendMail({
+      to: TO_FAILURE,
+      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      text: body,
+      html: `<pre style="font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; color:#b00020">${escapeHtml(body)}</pre>`
+    });
+  } catch (e) {
+    console.warn('[MAIL] failure email failed:', e && (e.message || String(e)));
+  }
+}
+
+/* ---------------------------- tokens & clients ----------------------------- */
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID || '';
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET || '';
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN || '';
+const ZOHO_DC = (process.env.ZOHO_DC || 'com').trim(); // com|in|eu...
+
+const AZURE_CLIENT_ID = process.env.AZURE_CLIENT_ID || '';
+const AZURE_CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET || '';
+const AZURE_TENANT_ID = process.env.AZURE_TENANT_ID || '';
+
+axios.defaults.timeout = 15000; // sane default
+
+async function getZohoAccessToken() {
+  const tokenUrl = `https://accounts.zoho.${ZOHO_DC}/oauth/v2/token`;
+  const formData = qs.stringify({
+    refresh_token: ZOHO_REFRESH_TOKEN,
+    client_id: ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    grant_type: 'refresh_token'
+  });
+  const res = await axios.post(tokenUrl, formData, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 15000,
+    validateStatus: () => true
+  });
+  if (res.status !== 200 || !res.data?.access_token) {
+    const msg = res.data?.error_description || res.data?.error || JSON.stringify(res.data || {});
+    throw new Error(`Zoho token error (${res.status}): ${msg}`);
+  }
+  return res.data.access_token;
+}
+
+async function getAzureAccessToken() {
+  try {
+    const res = await axios.post(
+      `https://login.microsoftonline.com/${encodeURIComponent(AZURE_TENANT_ID)}/oauth2/v2.0/token`,
+      qs.stringify({
+        client_id: AZURE_CLIENT_ID,
+        client_secret: AZURE_CLIENT_SECRET,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials'
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000, validateStatus: () => true }
+    );
+    if (res.status !== 200 || !res.data?.access_token) {
+      const msg = res.data?.error_description || res.data?.error || JSON.stringify(res.data || {});
+      throw new Error(`Azure token error (${res.status}): ${msg}`);
+    }
+    return res.data.access_token;
+  } catch (err) {
+    const details = err?.response?.data || err?.message || String(err);
+    console.error('[AUTH] Azure token refresh failed:', details);
+    throw err;
+  }
+}
+
+/* --------------------------------- routes ---------------------------------- */
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+/**
+ * Prehire: compute provisional email and write it back to Zoho Candidate.Other_Email
+ */
+app.post('/zoho-candidate/edit', async (req, res) => {
+  try {
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+
+    const { value: employeeType } = pickWithKey(data, [
+      'employeeType', 'employmentType', 'employementType',
+      'Employee_Type', 'Employee Type', 'EmployeeType', 'empType', 'typeOfEmployee'
+    ]);
+
+    const { id, firstname, lastname } = data;
+    if (!id || !firstname || !lastname) {
+      return res.status(400).json({
+        message: 'Missing firstname, lastname, or candidate ID',
+        receivedKeys: Object.keys(data || {})
+      });
+    }
+
+    const domain = (process.env.OFFICIAL_EMAIL_DOMAIN || get('AZURE_DEFAULT_DOMAIN') || 'roundglass.com').trim();
+    const local = normNickname(firstname, lastname);
+    const pref = prefixForEmployeeType(employeeType);
+    const officialEmail = `${pref}${local}@${domain}`;
+
+    // correct Zoho People path includes "/people/api"
+    const formData = qs.stringify({
+      recordId: id,
+      inputData: JSON.stringify({ Other_Email: officialEmail })
+    });
+
+    const accessToken = await getZohoAccessToken();
+    const zohoRes = await axios.post(
+      `https://people.zoho.${ZOHO_DC}/people/api/forms/json/Candidate/updateRecord`,
+      formData,
+      {
+        headers: {
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded'

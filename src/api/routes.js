@@ -34,8 +34,11 @@ const {
 
 const {
   sendSuccessMail,
-  sendFailureMail
+  sendFailureMail,
+  sendMail,
+  verifyEmailTransport
 } = require('../infra/email');
+const { env, emailEnabled } = require('../infra/env');
 
 const tz = process.env.TZ || 'Asia/Kolkata';
 
@@ -67,6 +70,24 @@ function pick(obj, keys) {
 
 router.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Quick email test under API router
+router.get('/email/test', async (req, res) => {
+  try {
+    if (!emailEnabled()) {
+      return res.status(503).json({ ok: false, message: 'Email disabled or not configured' });
+    }
+    try { if (verifyEmailTransport) await verifyEmailTransport(); } catch {}
+    const to = String(req.query.to || env.EMAIL_TO_SUCCESS || env.EMAIL_TO_FAILURE || env.EMAIL_TO_SUMMARY || env.EMAIL_SMTP_USER || env.EMAIL_FROM || '').trim();
+    if (!to) return res.status(400).json({ ok: false, message: 'Recipient not specified. Provide ?to= or set EMAIL_TO_SUCCESS.' });
+    const ts = new Date().toISOString();
+    await sendMail({ to, subject: 'TEST email ping', text: `Test email at ${ts}` });
+    res.json({ ok: true, to, sentAt: ts });
+  } catch (e) {
+    const details = e?.message || String(e);
+    res.status(500).json({ ok: false, error: details });
+  }
 });
 
 router.post('/zoho-candidate/edit', verifySignature, async (req, res) => {

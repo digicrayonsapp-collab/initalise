@@ -4,6 +4,8 @@ const nodemailer = require('nodemailer');
 const { env, emailEnabled } = require('./env');
 
 let transporter = null;
+let verifiedOnce = false;
+let verifying = false;
 
 function ensureTransport() {
   if (!emailEnabled()) return null;
@@ -18,6 +20,30 @@ function ensureTransport() {
     maxMessages: 100
   });
   return transporter;
+}
+
+async function verifyEmailTransport() {
+  try {
+    if (verifiedOnce || verifying) return;
+    if (!emailEnabled()) {
+      const reason = env.EMAIL_MODE === 'off'
+        ? 'EMAIL_MODE=off'
+        : 'missing SMTP config (host/user/pass)';
+      console.warn('[email:disabled]', reason);
+      verifiedOnce = true; // avoid repeating
+      return;
+    }
+    const tx = ensureTransport();
+    if (!tx) return; // already logged above
+    verifying = true;
+    await tx.verify();
+    console.log('[email:ok]', `SMTP verified host=${env.EMAIL_SMTP_HOST} port=${env.EMAIL_SMTP_PORT} secure=${!!env.EMAIL_SMTP_SECURE}`);
+  } catch (err) {
+    console.warn('[email:verify_failed]', (err && err.message) || String(err));
+  } finally {
+    verifying = false;
+    verifiedOnce = true;
+  }
 }
 
 async function sendMail(spec) {
@@ -49,4 +75,4 @@ async function sendFailureMail({ subject, text, html, to }) {
   return sendMail({ to: to || env.EMAIL_TO_FAILURE, subject, text, html });
 }
 
-module.exports = { sendMail, sendSuccessMail, sendFailureMail };
+module.exports = { sendMail, sendSuccessMail, sendFailureMail, verifyEmailTransport };

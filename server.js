@@ -53,7 +53,8 @@ const { get, getInt } = (() => {
 
 // optional mailer; if absent, emailing no-ops safely
 let sendMail = null;
-try { ({ sendMail } = require('./src/infra/email')); } catch {}
+let verifyEmailTransport = null;
+try { ({ sendMail, verifyEmailTransport } = require('./src/infra/email')); } catch {}
 
 const EMAIL_MODE = (get('EMAIL_MODE', 'event') || 'event').toLowerCase();
 const EMAIL_SUBJECT_PREFIX = get('EMAIL_SUBJECT_PREFIX', '[Zoho-Azure Sync]');
@@ -65,6 +66,9 @@ const mailEnabled = !!sendMail && EMAIL_MODE !== 'off';
 app.use(express.json({ limit: '256kb' }));
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 initBus();
+
+// Verify SMTP transport once on startup (non-fatal)
+try { if (verifyEmailTransport) verifyEmailTransport(); } catch {}
 
 /* --------------------------------- helpers --------------------------------- */
 const { DateTime } = (() => {
@@ -130,7 +134,8 @@ async function mailSuccess(subject, body) {
   try {
     await sendMail({
       to: TO_SUCCESS,
-      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      // No manual prefixing here; sendMail applies global prefix
+      subject: String(subject || ''),
       text: body,
       html: `<pre style="font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace">${escapeHtml(body)}</pre>`
     });
@@ -144,7 +149,8 @@ async function mailFailure(subject, body) {
   try {
     await sendMail({
       to: TO_FAILURE,
-      subject: `${EMAIL_SUBJECT_PREFIX} ${subject}`.trim(),
+      // No manual prefixing here; sendMail applies global prefix
+      subject: String(subject || ''),
       text: body,
       html: `<pre style="font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; color:#b00020">${escapeHtml(body)}</pre>`
     });
@@ -213,6 +219,24 @@ async function getAzureAccessToken() {
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Quick email test endpoint (non-fatal, safe)
+app.get('/email/test', async (req, res) => {
+  try {
+    if (!mailEnabled) {
+      return res.status(503).json({ ok: false, message: 'Email disabled or not configured' });
+    }
+    const to = String(req.query.to || TO_SUCCESS || TO_FAILURE || process.env.EMAIL_SMTP_USER || process.env.EMAIL_FROM || '').trim();
+    if (!to) return res.status(400).json({ ok: false, message: 'Recipient not specified. Provide ?to= or set EMAIL_TO_SUCCESS.' });
+    const ts = new Date().toISOString();
+    await sendMail({ to, subject: 'TEST email ping', text: `Test email at ${ts}` });
+    res.json({ ok: true, to, sentAt: ts });
+  } catch (e) {
+    const details = e?.message || String(e);
+    // Do not throw; reply with failure info
+    res.status(500).json({ ok: false, error: details });
+  }
 });
 
 /**
@@ -373,6 +397,129 @@ app.post('/zoho-webhook/create', async (req, res) => {
     emitSafe('sync:failure', { action: 'user-create', error: details });
     await mailFailure('CREATE user failed', String(details));
     return res.status(500).json({ message: 'Failed to create user in Azure AD', error: details });
+  }
+});
+
+// Update Azure user fields from Zoho webhook (edit)
+app.post('/zoho-webhook/edit', async (req, res) => {
+  try {
+    const data = (req.body && Object.keys(req.body).length) ? req.body : req.query;
+
+    const upn = data.userPrincipalName || data.upn || data.Other_Email || data['Other Email'] || data.otherEmail;
+    const { email, employeeId, manager } = data;
+    const {
+      firstname, lastname, city, country, mobilePhone, department,
+      zohoRole, company, employementType, officelocation, joiningdate
+    } = data;
+
+    // Build patch (only defined values)
+    const patch = {
+      displayName: (firstname || lastname) ? `${firstname || ''} ${lastname || ''}`.trim() : undefined,
+      givenName: firstname || undefined,
+      surname: lastname || undefined,
+      otherMails: email ? [String(email).trim()] : undefined,
+      employeeId: employeeId || undefined,
+      country: country || undefined,
+      city: city || undefined,
+      mobilePhone: mobilePhone || undefined,
+      department: department || undefined,
+      jobTitle: zohoRole || undefined,
+      companyName: company || undefined,
+      employeeType: employementType || undefined,
+      officeLocation: officelocation || undefined
+    };
+    if (joiningdate) {
+      try {
+        const [dd, mm, yyyy] = String(joiningdate).split('-');
+        const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
+        if (!isNaN(dt.getTime())) patch.employeeHireDate = dt.toISOString().replace(/\.\d{3}Z$/, 'Z');
+      } catch {}
+    }
+    Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
+
+    // Dry-run mode: don't hit Graph, just acknowledge
+    if (String(process.env.DRY_RUN || '').toLowerCase() === 'true') {
+      await mailSuccess('EDIT dry-run', `lookedUpBy=dry-run\nfields=${Object.keys(patch).join(', ')}`);
+      return res.json({
+        message: 'dry_run: Azure user would be updated',
+        lookedUpBy: 'dry-run',
+        updatedFields: Object.keys(patch),
+        handledAt: new Date().toISOString()
+      });
+    }
+
+    // Real invocation
+    const accessToken = await getAzureAccessToken();
+    let user = null;
+    let lookedUpBy = null;
+
+    if (upn) {
+      const filter = `$filter=userPrincipalName eq '${odataQuote(String(upn).trim())}'&$select=id,userPrincipalName,employeeId`;
+      const resU = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (resU.data?.value?.length) { user = resU.data.value[0]; lookedUpBy = `UPN:${upn}`; }
+    }
+    if (!user && email) {
+      const e = odataQuote(String(email).trim());
+      const filter = `$filter=(mail eq '${e}') or (otherMails/any(c:c eq '${e}'))&$select=id,userPrincipalName,employeeId`;
+      const resE = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (resE.data?.value?.length) { user = resE.data.value[0]; lookedUpBy = `email:${email}`; }
+    }
+    if (!user && employeeId) {
+      const f = odataQuote(String(employeeId).trim());
+      const filter = `$filter=employeeId eq '${f}'&$select=id,userPrincipalName,employeeId`;
+      const resI = await axios.get(`https://graph.microsoft.com/v1.0/users?${filter}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (resI.data?.value?.length) { user = resI.data.value[0]; lookedUpBy = `employeeId:${employeeId}`; }
+    }
+
+    if (!user) {
+      const msg = 'Azure user not found. Provide one of: userPrincipalName/upn/Other_Email or email or employeeId.';
+      await mailFailure('EDIT failed (user not found)', msg);
+      return res.status(404).json({ message: msg });
+    }
+
+    if (manager) {
+      try {
+        const mgrCode = String(manager).split(' ').pop();
+        const f = odataQuote(mgrCode);
+        const mRes = await axios.get(
+          `https://graph.microsoft.com/v1.0/users?$filter=employeeId eq '${f}'&$select=id`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        const mUser = mRes.data?.value?.[0];
+        if (mUser?.id) {
+          await axios.put(
+            `https://graph.microsoft.com/v1.0/users/${user.id}/manager/$ref`,
+            { '@odata.id': `https://graph.microsoft.com/v1.0/directoryObjects/${mUser.id}` },
+            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+          );
+        }
+      } catch (e) {
+        console.warn('[EDIT] manager update failed:', e?.response?.data || e?.message || String(e));
+      }
+    }
+
+    if (Object.keys(patch).length) {
+      await axios.patch(
+        `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.id)}`,
+        patch,
+        { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    await mailSuccess('EDIT succeeded', `Updated ${user.userPrincipalName || user.id}. Fields: ${Object.keys(patch).join(', ')}`);
+    return res.json({
+      message: 'Azure user updated',
+      userId: user.id,
+      upn: user.userPrincipalName,
+      lookedUpBy,
+      updatedFields: Object.keys(patch),
+      handledAt: new Date().toISOString()
+    });
+  } catch (error) {
+    const details = error?.response?.data || error?.message || String(error);
+    console.error('[EDIT] failed:', details);
+    await mailFailure('EDIT failed', String(details));
+    return res.status(500).json({ message: 'Failed to update Azure user', error: details });
   }
 });
 

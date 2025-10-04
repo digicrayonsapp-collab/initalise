@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const express = require('express');
 const helmet = require('helmet');
@@ -15,7 +15,7 @@ const routes = require('./api/routes');
 const { get } = require('./config/env');
 const { DateTime } = require('luxon');
 
-const { sendSuccessMail, sendFailureMail, verifyEmailTransport } = require('./infra/email');
+const { sendSuccessMail, sendFailureMail } = require('./infra/email');
 
 const { getAzureAccessToken } = require('./services/graphAuth');
 const {
@@ -36,7 +36,7 @@ const {
 function mask(s) {
   if (!s) return 'MISSING';
   s = String(s);
-  return s.length <= 6 ? '***' : `${s.slice(0, 3)}…${s.slice(-3)}`;
+  return s.length <= 6 ? '***' : `${s.slice(0, 3)}â€¦${s.slice(-3)}`;
 }
 log.info(
   'Azure env:',
@@ -283,13 +283,6 @@ function buildApp() {
   app.use(httpLogger);
   app.use('/api', routes);
 
-  // Aliases for Zoho to call without /api prefix
-  app.post('/zoho-candidate/edit', (req, res, next) => routes(req, res, next));
-  app.post('/zoho-webhook/edit', (req, res, next) => routes(req, res, next));
-  app.post('/zoho-webhook/delete', (req, res, next) => routes(req, res, next));
-  app.get('/health', (req, res, next) => routes(req, res, next));
-  app.get('/email/test', (req, res, next) => routes(req, res, next));
-
   app.use((req, res, next) => next(new AppError(404, 'Not Found')));
   app.use((err, req, res, next) => {
     const e = toAppError(err);
@@ -304,8 +297,6 @@ async function bootstrap() {
   process.on('uncaughtException', (e) => console.error('uncaughtException', e));
 
   await initSQLite();
-  // Verify SMTP transport once on startup (non-fatal)
-  try { if (verifyEmailTransport) await verifyEmailTransport(); } catch {}
   const app = buildApp();
   const port = parseInt(get('PORT', 3008), 10);
   app.listen(port, '0.0.0.0', () => log.info(`http://0.0.0.0:${port}`));

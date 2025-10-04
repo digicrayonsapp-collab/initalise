@@ -1,0 +1,135 @@
+﻿      if (joiningdate) {
+        try {
+          const [dd, mm, yyyy] = String(joiningdate).split('-');
+          const dt = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
+          if (!isNaN(dt.getTime()) && graph.updateUser) {
+            await graph.updateUser(token, resUpsert.userId, { employeeHireDate: dt.toISOString().replace(/\.\d{3}Z$/, 'Z') });
+          }
+        } catch (e) {
+          console.warn('[JOB:create] set employeeHireDate failed:', e && (e.message || String(e)));
+        }
+      }
+
+      // push official email & EmpID back to Zoho candidate
+      if (candidateId && zoho.updateCandidateFields) {
+        try {
+          const official = zoho.officialEmailFromUpn ? zoho.officialEmailFromUpn(resUpsert.upn) : resUpsert.upn;
+          const officialField = process.env.OFFICIAL_EMAIL_FIELD_LINK_NAME || 'Other_Email';
+          const empIdField = process.env.ZOHO_EMPLOYEEID_FIELD_LINK_NAME || 'Employee_ID';
+          const fields = { [officialField]: official };
+          if (employeeId) fields[empIdField] = String(employeeId);
+          await zoho.updateCandidateFields({ recordId: candidateId, fields });
+        } catch (e) {
+          console.warn('[JOB:create] Zoho candidate update failed:', e && (e.message || String(e)));
+        }
+      }
+
+      // cooldown to suppress echo webhooks
+      if (candidateId) {
+        const mins = toInt(process.env.PREHIRE_COOLDOWN_MINUTES, 3);
+        setKV(`CANDIDATE_COOLDOWN_UNTIL:${candidateId}`, String(Date.now() + Math.max(0, mins) * 60 * 1000));
+      }
+
+      markJob(job.id, { status: 'done', result: { action: resUpsert.action, userId: resUpsert.userId, upn: resUpsert.upn } });
+      await note(true, 'CREATE done', `userId=${resUpsert.userId}\nupn=${resUpsert.upn}\naction=${resUpsert.action}`);
+      return;
+    } catch (e) {
+      const msg = e?.response?.data || e?.message || String(e);
+      console.error('[JOB:create] failed:', msg);
+      markJob(job.id, { status: 'failed', lastError: msg });
+      await note(false, 'CREATE failed', String(msg));
+      return;
+    }
+  }
+
+  // disableUser
+  if (type === 'disableuser') {
+    try {
+      const { employeeId, email, upn } = payload;
+      const token = await graphAuth.getAzureAccessToken();
+
+      let user = null;
+      if (employeeId && graph.findByEmployeeId) user = await graph.findByEmployeeId(token, String(employeeId).trim());
+      if (!user && email && graph.findByEmail) user = await graph.findByEmail(token, String(email).trim());
+      if (!user && upn && graph.findUserByUPN) user = await graph.findUserByUPN(token, String(upn).trim());
+
+      if (!user) {
+        const msg = 'User not found for disable';
+        markJob(job.id, { status: 'failed', lastError: msg });
+        await note(false, 'DISABLE failed (not found)', `employeeId=${employeeId || ''}\nemail=${email || ''}\nupn=${upn || ''}`);
+        return;
+      }
+
+      await graph.updateUser(token, user.id, { accountEnabled: false });
+      markJob(job.id, { status: 'done', result: { userId: user.id, upn: user.userPrincipalName } });
+      await note(true, 'DISABLE done', `userId=${user.id}\nupn=${user.userPrincipalName}`);
+      return;
+    } catch (e) {
+      const msg = e?.response?.data || e?.message || String(e);
+      console.error('[JOB:disableUser] failed:', msg);
+      markJob(job.id, { status: 'failed', lastError: msg });
+      await note(false, 'DISABLE failed', String(msg));
+      return;
+    }
+  }
+
+  // deleteUser
+  if (type === 'deleteuser') {
+    try {
+      const { employeeId, email, upn } = payload;
+      const token = await graphAuth.getAzureAccessToken();
+
+      let user = null;
+      if (employeeId && graph.findByEmployeeId) user = await graph.findByEmployeeId(token, String(employeeId).trim());
+      if (!user && email && graph.findByEmail) user = await graph.findByEmail(token, String(email).trim());
+      if (!user && upn && graph.findUserByUPN) user = await graph.findUserByUPN(token, String(upn).trim());
+
+      if (!user) {
+        const msg = 'User not found for delete';
+        markJob(job.id, { status: 'failed', lastError: msg });
+        await note(false, 'DELETE failed (not found)', `employeeId=${employeeId || ''}\nemail=${email || ''}\nupn=${upn || ''}`);
+        return;
+      }
+
+      try {
+        if (graph.revokeUserSessions) await graph.revokeUserSessions(token, user.id);
+      } catch (e) {
+        console.warn('[JOB:deleteUser] revoke sessions failed:', e && (e.message || String(e)));
+      }
+
+      await graph.deleteUser(token, user.id);
+
+      // verify best-effort
+      try { await graph.getUser(token, user.id, 'id'); }
+      catch (e) {
+        if (e?.response?.status === 404) { /* expected */ }
+        else console.warn('[JOB:deleteUser] verify read failed:', e && (e.message || String(e)));
+      }
+      try { await graph.getDeletedUser && graph.getDeletedUser(token, user.id); } catch {}
+
+      markJob(job.id, { status: 'done', result: { userId: user.id, upn: user.userPrincipalName } });
+      await note(true, 'DELETE done', `userId=${user.id}\nupn=${user.userPrincipalName}`);
+      return;
+    } catch (e) {
+      const msg = e?.response?.data || e?.message || String(e);
+      console.error('[JOB:deleteUser] failed:', msg);
+      markJob(job.id, { status: 'failed', lastError: msg });
+      await note(false, 'DELETE failed', String(msg));
+      return;
+    }
+  }
+
+  // unknown job
+  const msg = `Unknown job type: ${type}`;
+  console.warn('[JOB] ' + msg);
+  markJob(job.id, { status: 'failed', lastError: msg });
+}
+
+/* ------------------------------ bootstrap/run ------------------------------ */
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running at http://0.0.0.0:${PORT}`);
+});
+
+// start scheduler loop in this same process
+tickRunner(executor);
